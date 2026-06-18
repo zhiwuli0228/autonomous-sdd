@@ -15,6 +15,7 @@
 | tasks | `tasks.md` | numbered unchecked task list present |
 | plan | `plan.md` | exact files, tests, task ordering, commit points present |
 | apply | source/test changes and checked tasks | task test passes, scope/API/policy guards pass |
+| review | `review.md` | fresh-session scope, specification, tests, and clean-code review pass |
 | verify | `verify.md` | full configured verification and traceability pass |
 | finalize | `finalize.md` | clean checkpoint and delivery receipt present |
 | archive | archived change and synced specs | OpenSpec validation and repository consistency pass |

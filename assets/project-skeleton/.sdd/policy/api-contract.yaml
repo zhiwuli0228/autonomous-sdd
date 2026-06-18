@@ -4,7 +4,9 @@
     "compatibility": "exact",
     "protected_paths": [
       "provided-api/**",
-      "grader/**"
+      "grader/**",
+      "src/**/api/**",
+      "src/**/contract/**"
     ],
     "protected_symbols": [],
     "forbidden_changes": [

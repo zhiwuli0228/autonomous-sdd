@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+if [ "$#" -lt 2 ]; then
+  echo "Usage: sdd-competition PROJECT TASK_FILE [--rehearse]" >&2
+  exit 2
+fi
+if [ "${3:-}" = "--rehearse" ]; then
+  exec python3 "$(dirname "$0")/scripts/sdd.py" --project "$1" compete --task "$2" --executor fixture
+fi
+exec python3 "$(dirname "$0")/scripts/sdd.py" --project "$1" compete --task "$2"

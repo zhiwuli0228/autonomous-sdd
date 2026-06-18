@@ -76,6 +76,98 @@ class RunnerSmokeTest(unittest.TestCase):
         result = run("--project", str(self.project), "recover", expected=2)
         self.assertIn("changed:.sdd/policy/project.yaml", result.stdout)
 
+    def test_one_command_fixture_closes_full_lifecycle(self) -> None:
+        result = run(
+            "--project",
+            str(self.project),
+            "compete",
+            "--task",
+            "Implement a deterministic bounded behavior without protected API changes",
+            "--change-id",
+            "complete-rehearsal",
+            "--executor",
+            "fixture",
+            "--max-steps",
+            "30",
+        )
+        self.assertIn("RESULT=CLOSED", result.stdout)
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual("closed", state["status"])
+        self.assertTrue((self.project / ".sdd" / "delivery-report.md").exists())
+        archives = list((self.project / "openspec" / "changes" / "archive").glob("*-complete-rehearsal"))
+        self.assertEqual(1, len(archives))
+        self.assertTrue((self.project / "openspec" / "specs" / "competition-sample" / "spec.md").exists())
+
+    def test_compete_bootstraps_plain_repository(self) -> None:
+        plain = self.temp / "plain"
+        plain.mkdir()
+        subprocess.run(["git", "init"], cwd=plain, check=True, stdout=subprocess.PIPE)
+        subprocess.run(["git", "config", "user.name", "SDD Test"], cwd=plain, check=True)
+        subprocess.run(["git", "config", "user.email", "sdd@example.invalid"], cwd=plain, check=True)
+        (plain / "src").mkdir()
+        (plain / "src" / "existing.txt").write_text("existing project\n", encoding="utf-8")
+        subprocess.run(["git", "add", "--all"], cwd=plain, check=True)
+        subprocess.run(["git", "commit", "-m", "initial project"], cwd=plain, check=True, stdout=subprocess.PIPE)
+        result = run(
+            "--project",
+            str(plain),
+            "compete",
+            "--task",
+            "Deliver a complete unattended rehearsal from a plain repository",
+            "--change-id",
+            "plain-repository-rehearsal",
+            "--executor",
+            "fixture",
+        )
+        self.assertIn("RESULT=CLOSED", result.stdout)
+        self.assertTrue((plain / "sdd.cmd").exists())
+        self.assertTrue((plain / ".sdd" / "delivery-report.md").exists())
+
+    def test_one_command_failure_exhausts_budget_and_reports_blocked(self) -> None:
+        config_path = self.project / ".sdd" / "config.yaml"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["fixture_fail_stage"] = "proposal"
+        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        subprocess.run(["git", "add", "--all"], cwd=self.project, check=True)
+        subprocess.run(["git", "commit", "-m", "test: inject proposal failure"], cwd=self.project, check=True)
+        result = run(
+            "--project",
+            str(self.project),
+            "compete",
+            "--task",
+            "Exercise safe unattended failure handling and final blocked reporting",
+            "--change-id",
+            "blocked-rehearsal",
+            "--executor",
+            "fixture",
+            "--max-steps",
+            "20",
+            expected=2,
+        )
+        self.assertIn("Injected deterministic failure at stage proposal", result.stdout)
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual("blocked", state["status"])
+        report = (self.project / ".sdd" / "delivery-report.md").read_text(encoding="utf-8")
+        self.assertIn("Outcome: `BLOCKED`", report)
+
+    def test_default_api_paths_are_frozen_by_baseline(self) -> None:
+        api = self.project / "src" / "main" / "java" / "sample" / "api" / "StableApi.java"
+        api.parent.mkdir(parents=True)
+        api.write_text("public interface StableApi {}\n", encoding="utf-8")
+        subprocess.run(["git", "add", "--all"], cwd=self.project, check=True)
+        subprocess.run(["git", "commit", "-m", "feat: add stable api"], cwd=self.project, check=True)
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "api-guard",
+            "Verify protected competition API files cannot be modified",
+        )
+        api.write_text("public interface StableApi { void changed(); }\n", encoding="utf-8")
+        result = run("--project", str(self.project), "recover", expected=2)
+        self.assertIn("changed:src/main/java/sample/api/StableApi.java", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,17 +9,25 @@ Treat the model as a bounded stage executor. Treat repository files, Git commits
 
 ## Entry points
 
-Initialize a target repository:
+Run the full competition workflow with one command:
 
 ```text
-python scripts/sdd.py init <project>
+python scripts/sdd.py --project <project> compete --task <task-file>
 ```
 
-Start and run a change:
+On Windows, the packaged one-command entry is:
 
 ```text
-<project>/sdd start <change-id> "<objective>"
-<project>/sdd run
+sdd-competition.cmd <project> <task-file>
+```
+
+Use `--rehearse` as the optional third argument to validate the entire control
+system without invoking a model.
+
+After installation into a project, use:
+
+```text
+<project>/sdd compete --task <task-file>
 ```
 
 On Windows use `sdd.cmd`.
@@ -47,7 +55,8 @@ Use this lifecycle:
 
 ```text
 brainstorm → proposal → specs → design → tasks → plan
-→ apply task loop → verify → finalize → archive → retrospective → closed
+→ apply task loop → independent review → verify → finalize → archive
+→ retrospective → closed
 ```
 
 The Runner creates a constrained task packet, invokes `opencode run`, validates actual outputs, writes a handoff, and advances state. During `apply`, execute one unchecked task per fresh session.

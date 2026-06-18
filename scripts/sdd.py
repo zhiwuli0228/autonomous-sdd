@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 STAGES = [
     "brainstorm",
     "proposal",
@@ -32,6 +32,7 @@ STAGES = [
     "tasks",
     "plan",
     "apply",
+    "review",
     "verify",
     "finalize",
     "archive",
@@ -44,6 +45,7 @@ ARTIFACTS = {
     "design": "design.md",
     "tasks": "tasks.md",
     "plan": "plan.md",
+    "review": "review.md",
     "verify": "verify.md",
     "finalize": "finalize.md",
 }
@@ -59,6 +61,7 @@ REQUIRED_SECTIONS = {
         "Testing Strategy",
     ],
     "plan": ["Execution Strategy", "Tasks", "Verification", "Checkpoint Strategy"],
+    "review": ["Scope Compliance", "Specification Compliance", "Clean Code Review", "Findings", "Decision"],
     "verify": ["Structural Validation", "Requirement Traceability", "Quality Gates", "Decision"],
     "finalize": ["Outcome", "Repository State", "Evidence"],
 }
@@ -151,6 +154,10 @@ def load_config(root: Path) -> dict[str, Any]:
     return load_json(sdd_dir(root) / "config.yaml")
 
 
+def save_config(root: Path, config: dict[str, Any]) -> None:
+    atomic_json(sdd_dir(root) / "config.yaml", config)
+
+
 def change_dir(root: Path, state: dict[str, Any]) -> Path:
     return root / "openspec" / "changes" / state["change_id"]
 
@@ -174,11 +181,15 @@ def git_head(root: Path) -> str:
 
 
 def git_changed(root: Path) -> list[str]:
-    output = git(root, "status", "--porcelain", check=False)
+    result = run_command(["git", "status", "--porcelain"], root, timeout=120)
+    output = result.stdout or ""
     changed: list[str] = []
     for line in output.splitlines():
         if len(line) >= 4:
-            changed.append(line[3:].strip().replace("\\", "/"))
+            path = line[3:].strip().replace("\\", "/")
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            changed.append(path.strip('"'))
     return sorted(set(changed))
 
 
@@ -192,15 +203,17 @@ def schema_files(root: Path) -> list[Path]:
 
 def protected_control_hashes(root: Path) -> dict[str, str]:
     files = policy_files(root) + schema_files(root)
+    files.extend([sdd_dir(root) / "config.yaml", sdd_dir(root) / "AGENT-INSTRUCTIONS.md"])
     return {rel(root, path): sha256(path) for path in files if path.is_file()}
 
 
 def capture_files(root: Path, patterns: list[str]) -> dict[str, str]:
     captured: dict[str, str] = {}
-    for pattern in patterns:
-        for path in root.glob(pattern):
-            if path.is_file() and ".git" not in path.parts:
-                captured[rel(root, path)] = sha256(path)
+    for path in root.rglob("*"):
+        if path.is_file() and ".git" not in path.parts:
+            relative = rel(root, path)
+            if matches(relative, patterns):
+                captured[relative] = sha256(path)
     return dict(sorted(captured.items()))
 
 
@@ -231,7 +244,18 @@ def init_project(args: argparse.Namespace) -> None:
     source = Path(__file__).resolve().parent.parent / "assets" / "project-skeleton"
     if (root / ".sdd").exists() and not args.force:
         raise SddError(f"{root} is already initialized; use --force only before a competition run")
-    shutil.copytree(source, root, dirs_exist_ok=True)
+    preserve = {"AGENTS.md", "opencode.json", "openspec/config.yaml", ".gitignore"}
+    for source_path in source.rglob("*"):
+        relative = source_path.relative_to(source)
+        target = root / relative
+        if source_path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if relative.as_posix() in preserve and target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target)
+    ensure_runtime_ignores(root)
     target_runner = root / ".sdd" / "bin" / "sdd.py"
     target_runner.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(Path(__file__).resolve(), target_runner)
@@ -243,7 +267,137 @@ def init_project(args: argparse.Namespace) -> None:
     if not (root / ".git").exists():
         git(root, "init")
     print(f"Initialized Autonomous SDD {VERSION} in {root}")
-    print("Next: edit .sdd/policy/*.yaml, then run `sdd baseline`.")
+    print("Run `sdd compete --task <file-or-text>` for one-command delivery.")
+
+
+def ensure_runtime_ignores(root: Path) -> None:
+    path = root / ".gitignore"
+    current = path.read_text(encoding="utf-8") if path.exists() else ""
+    required = [".sdd/runtime/", ".sdd/evidence/", ".sdd/baseline/", ".sdd/bin/", ".opencode/storage/"]
+    missing = [entry for entry in required if entry not in current.splitlines()]
+    if missing:
+        separator = "" if not current or current.endswith("\n") else "\n"
+        path.write_text(
+            current + separator + "\n# Autonomous SDD machine-local state\n" + "\n".join(missing) + "\n",
+            encoding="utf-8",
+        )
+
+
+def compete(args: argparse.Namespace) -> None:
+    root = project_root(args.project)
+    objective = read_task(args.task, root)
+    preexisting_git = (root / ".git").exists()
+    if preexisting_git and git_changed(root):
+        raise SddError("One-command competition execution requires a clean repository before start")
+    if not (root / ".sdd").exists():
+        init_project(argparse.Namespace(project=str(root), force=False))
+    ensure_git_identity(root)
+    detected = detect_project(root)
+    configure_detected_project(root, detected)
+    config = load_config(root)
+    config["executor"] = args.executor
+    save_config(root, config)
+    if not preexisting_git or not git(root, "rev-parse", "--verify", "HEAD", check=False):
+        commit_all(root, "chore: establish competition baseline")
+    else:
+        commit_all(root, "chore: install autonomous competition harness")
+    baseline(argparse.Namespace(project=str(root)))
+    change_id = unique_change_id(root, args.change_id or slugify(objective))
+    start(argparse.Namespace(project=str(root), change_id=change_id, objective=objective))
+    try:
+        run_loop(argparse.Namespace(project=str(root), max_steps=args.max_steps))
+    finally:
+        if state_path(root).exists():
+            state = load_state(root)
+            if state["status"] in {"closed", "blocked"}:
+                report = emit_final_report(root, state)
+                if git_changed(root):
+                    final_commit = commit_all(root, f"sdd({state['change_id']}): record final delivery")
+                    state["delivery_report"] = rel(root, report)
+                    state["delivery_commit"] = final_commit
+                    save_state(root, state)
+    final = load_state(root)
+    print(f"RESULT={final['status'].upper()}")
+    print(f"REPORT={sdd_dir(root) / 'delivery-report.md'}")
+    if final["status"] != "closed":
+        raise SddError(f"Competition run ended as {final['status']}")
+
+
+def detect_project(root: Path) -> dict[str, Any]:
+    if (root / "mvnw.cmd").exists():
+        return {"kind": "java-maven", "test": [".\\mvnw.cmd", "test"], "sources": ["src/**"]}
+    if (root / "mvnw").exists():
+        return {"kind": "java-maven", "test": ["./mvnw", "test"], "sources": ["src/**"]}
+    if (root / "pom.xml").exists():
+        return {"kind": "java-maven", "test": ["mvn", "test"], "sources": ["src/**"]}
+    if (root / "gradlew.bat").exists():
+        return {"kind": "java-gradle", "test": [".\\gradlew.bat", "test"], "sources": ["src/**"]}
+    if (root / "gradlew").exists():
+        return {"kind": "java-gradle", "test": ["./gradlew", "test"], "sources": ["src/**"]}
+    if (root / "package.json").exists():
+        manager = "pnpm" if (root / "pnpm-lock.yaml").exists() else "npm"
+        return {"kind": "javascript", "test": [manager, "test"], "sources": ["src/**", "test/**", "tests/**"]}
+    if (root / "pyproject.toml").exists() or (root / "pytest.ini").exists():
+        return {"kind": "python", "test": [sys.executable, "-m", "pytest"], "sources": ["src/**", "test/**", "tests/**"]}
+    if (root / "go.mod").exists():
+        return {"kind": "go", "test": ["go", "test", "./..."], "sources": ["**/*.go"]}
+    if (root / "Cargo.toml").exists():
+        return {"kind": "rust", "test": ["cargo", "test"], "sources": ["src/**", "tests/**"]}
+    return {"kind": "generic", "test": [], "sources": ["src/**", "test/**", "tests/**"]}
+
+
+def configure_detected_project(root: Path, detected: dict[str, Any]) -> None:
+    verification_path = sdd_dir(root) / "policy" / "verification.yaml"
+    verification = load_json(verification_path)
+    verification["commands"]["project_test"] = detected["test"]
+    atomic_json(verification_path, verification)
+    project_path = sdd_dir(root) / "policy" / "project.yaml"
+    project = load_json(project_path)
+    project["detected_project_kind"] = detected["kind"]
+    project["change_boundaries"]["allowed"] = detected["sources"]
+    atomic_json(project_path, project)
+
+
+def ensure_git_identity(root: Path) -> None:
+    if not git(root, "config", "user.name", check=False):
+        git(root, "config", "user.name", "Autonomous SDD")
+    if not git(root, "config", "user.email", check=False):
+        git(root, "config", "user.email", "autonomous-sdd@localhost.invalid")
+
+
+def commit_all(root: Path, message: str) -> str:
+    git(root, "add", "--all")
+    if git(root, "status", "--porcelain", check=False):
+        git(root, "commit", "-m", message)
+    return git_head(root)
+
+
+def read_task(value: str, root: Path) -> str:
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    if candidate.is_file():
+        text = candidate.read_text(encoding="utf-8").strip()
+    else:
+        text = value.strip()
+    if len(text) < 10:
+        raise SddError("Competition task must contain at least 10 characters")
+    return text
+
+
+def slugify(value: str) -> str:
+    words = re.findall(r"[a-z0-9]+", value.lower())
+    base = "-".join(words[:6]) or "competition-change"
+    return base[:60].strip("-")
+
+
+def unique_change_id(root: Path, preferred: str) -> str:
+    candidate = preferred
+    active = root / "openspec" / "changes" / candidate
+    archived = list((root / "openspec" / "changes" / "archive").glob(f"*-{candidate}"))
+    if not active.exists() and not archived:
+        return candidate
+    return f"{preferred[:45].rstrip('-')}-{dt.datetime.now():%Y%m%d%H%M%S}"
 
 
 def doctor(args: argparse.Namespace) -> None:
@@ -368,6 +522,51 @@ def required_output(root: Path, state: dict[str, Any]) -> str:
     return rel(root, artifact) if artifact else stage
 
 
+def stage_required_reads(root: Path, state: dict[str, Any]) -> list[str]:
+    stage = state["stage"]
+    change = change_dir(root, state)
+    template_root = root / "openspec" / "schemas" / "autonomous-superspec" / "templates"
+    reads = [
+        ".sdd/AGENT-INSTRUCTIONS.md",
+        ".sdd/runtime/state.json",
+        ".sdd/runtime/current-handoff.json",
+        ".sdd/policy/competition.yaml",
+        ".sdd/policy/project.yaml",
+        ".sdd/policy/api-contract.yaml",
+        ".sdd/policy/coding-standard.yaml",
+    ]
+    template_name = ARTIFACTS.get(stage)
+    if stage == "specs":
+        template_name = "spec.md"
+    elif stage == "retrospective":
+        template_name = "retrospective.md"
+    if template_name and (template_root / template_name).exists():
+        reads.append(rel(root, template_root / template_name))
+    if change.exists():
+        for name in [
+            "brainstorm.md",
+            "proposal.md",
+            "design.md",
+            "tasks.md",
+            "plan.md",
+            "apply.md",
+            "review.md",
+            "verify.md",
+        ]:
+            path = change / name
+            if path.exists():
+                reads.append(rel(root, path))
+        for spec in sorted((change / "specs").glob("*/spec.md")):
+            reads.append(rel(root, spec))
+        reads.append(rel(root, change / ".openspec.yaml"))
+    elif stage == "retrospective":
+        archives = sorted((root / "openspec" / "changes" / "archive").glob(f"*-{state['change_id']}"))
+        if archives:
+            for path in archives[-1].rglob("*.md"):
+                reads.append(rel(root, path))
+    return list(dict.fromkeys(reads))
+
+
 def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
     competition = load_json(sdd_dir(root) / "policy" / "competition.yaml")
     project_policy = load_json(sdd_dir(root) / "policy" / "project.yaml")
@@ -378,6 +577,14 @@ def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
         allowed = sorted(set(allowed) & set(project_policy["change_boundaries"]["allowed"])) or project_policy[
             "change_boundaries"
         ]["allowed"]
+        allowed.extend(
+            [
+                f"openspec/changes/{state['change_id']}/tasks.md",
+                f"openspec/changes/{state['change_id']}/apply.md",
+                ".sdd/runtime/**",
+                ".sdd/evidence/**",
+            ]
+        )
     packet = {
         "schema_version": 1,
         "run_id": state["run_id"],
@@ -386,11 +593,7 @@ def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
         "role": "implementation" if stage == "apply" else stage,
         "objective": state["objective"],
         "required_output": required_output(root, state),
-        "required_reads": [
-            ".sdd/runtime/state.json",
-            ".sdd/runtime/current-handoff.json",
-            f"openspec/changes/{state['change_id']}/.openspec.yaml",
-        ],
+        "required_reads": stage_required_reads(root, state),
         "allowed_paths": allowed,
         "forbidden_paths": sorted(
             set(competition["modification"]["forbidden"] + api_policy["public_api"]["protected_paths"])
@@ -405,6 +608,7 @@ def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
         "acceptance": {
             "write_result": ".sdd/runtime/agent-result.json",
             "result_statuses": ["completed", "failed", "blocked"],
+            "required_sections": REQUIRED_SECTIONS.get(stage, []),
             "tests": load_json(sdd_dir(root) / "policy" / "verification.yaml")["commands"],
         },
     }
@@ -417,13 +621,215 @@ def prompt_for(packet: dict[str, Any]) -> str:
     return (
         "You are a bounded executor in an unattended competition workflow. "
         "Read .sdd/runtime/task-packet.json and every required file. "
+        "Use the listed stage template exactly and preserve every required section. "
         "Perform exactly the declared stage or one apply task. "
         "Do not commit or change lifecycle state. Do not modify policy, baseline, runner, schema, "
         "dependency manifests, protected API, or forbidden paths. "
         "Write .sdd/runtime/agent-result.json using status, summary, files_read, files_changed, "
         "commands_run, tests, deviations, and blocking_reason. "
+        "Do not ask questions; if essential intent is ambiguous, return status blocked with the exact reason. "
         f"Current stage: {packet['stage']}. Required output: {packet['required_output']}."
     )
+
+
+def write_agent_result(root: Path, summary: str, changed: list[str]) -> None:
+    atomic_json(
+        sdd_dir(root) / "runtime" / "agent-result.json",
+        {
+            "status": "completed",
+            "summary": summary,
+            "files_read": [".sdd/runtime/task-packet.json", ".sdd/runtime/state.json"],
+            "files_changed": changed,
+            "commands_run": [],
+            "tests": [],
+            "deviations": [],
+            "blocking_reason": None,
+        },
+    )
+
+
+def fixture_execute(root: Path, state: dict[str, Any]) -> None:
+    """Deterministic lifecycle executor used to validate orchestration itself."""
+    stage = state["stage"]
+    if load_config(root).get("fixture_fail_stage") == stage:
+        raise SddError(f"Injected deterministic failure at stage {stage}")
+    directory = change_dir(root, state)
+    changed: list[str] = []
+    if stage == "brainstorm":
+        path = directory / "brainstorm.md"
+        path.write_text(
+            "# Brainstorm\n\n## Objective\n\n"
+            + state["objective"]
+            + "\n\n## Current State\n\nProject inspected by the deterministic rehearsal executor."
+            "\n\n## Binding Constraints\n\nPreserve protected APIs, dependencies, policies, and build files."
+            "\n\n## Scope\n\nDeliver only the requested bounded behavior."
+            "\n\n## Alternatives\n\n### Option A\n\nMinimal compatible change.\n\n### Option B\n\nBroader redesign."
+            "\n\n## Decision\n\nUse the minimal compatible change.\n\n## Risks\n\nRegression risk is controlled by tests."
+            "\n\n## Blocking Ambiguities\n\nNone\n",
+            encoding="utf-8",
+        )
+        changed.append(rel(root, path))
+    elif stage == "proposal":
+        path = directory / "proposal.md"
+        path.write_text(
+            "# Change Proposal\n\n## Why\n\n"
+            + state["objective"]
+            + "\n\n## What Changes\n\nAdd one bounded sample capability and its verification."
+            "\n\n## Capabilities\n\n### New Capabilities\n\n- `competition-sample`: Bounded competition behavior."
+            "\n\n### Modified Capabilities\n\n- None\n\n## Impact\n\nSource and tests only; no API or dependency changes.\n",
+            encoding="utf-8",
+        )
+        changed.append(rel(root, path))
+    elif stage == "specs":
+        path = directory / "specs" / "competition-sample" / "spec.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "## ADDED Requirements\n\n### Requirement: Produce bounded competition behavior\n\n"
+            "The system MUST provide the requested behavior without changing protected interfaces.\n\n"
+            "#### Scenario: Successful bounded delivery\n\n"
+            "- **WHEN** the competition task is executed\n"
+            "- **THEN** the requested behavior and automated evidence are produced\n",
+            encoding="utf-8",
+        )
+        changed.append(rel(root, path))
+    elif stage == "design":
+        path = directory / "design.md"
+        path.write_text(
+            "# Technical Design\n\n## Context\n\nA bounded competition change is required."
+            "\n\n## Goals\n\nImplement the requested behavior with tests."
+            "\n\n## Non-Goals\n\nNo API, dependency, policy, or architecture expansion."
+            "\n\n## Existing API Verification\n\n| API | Source | Result |\n|---|---|---|\n| protected surface | baseline | unchanged |"
+            "\n\n## Architecture and Boundaries\n\nKeep implementation within detected source paths."
+            "\n\n## Decisions\n\nUse a minimal compatible implementation."
+            "\n\n## Testing Strategy\n\nRun focused behavior checks and configured full gates.\n",
+            encoding="utf-8",
+        )
+        changed.append(rel(root, path))
+    elif stage == "tasks":
+        path = directory / "tasks.md"
+        path.write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [ ] 1.1 Implement the bounded sample behavior and focused evidence\n"
+            "- [ ] 1.2 Verify the implementation and clean-code constraints\n",
+            encoding="utf-8",
+        )
+        changed.append(rel(root, path))
+    elif stage == "plan":
+        path = directory / "plan.md"
+        path.write_text(
+            "# Execution Plan\n\n## Execution Strategy\n\nUse one isolated session per task."
+            "\n\n## Tasks\n\nImplement one task at a time using minimal changes and verification."
+            "\n\n## Verification\n\nRun configured task and full gates."
+            "\n\n## Checkpoint Strategy\n\nCommit after each passing deterministic gate.\n",
+            encoding="utf-8",
+        )
+        changed.append(rel(root, path))
+    elif stage == "apply":
+        tasks_path = directory / "tasks.md"
+        text = tasks_path.read_text(encoding="utf-8")
+        match = re.search(r"^- \[ \] (.+)$", text, flags=re.MULTILINE)
+        if match:
+            text = text[: match.start()] + f"- [x] {match.group(1)}" + text[match.end() :]
+            tasks_path.write_text(text, encoding="utf-8")
+            changed.append(rel(root, tasks_path))
+        output = root / "src" / "autonomous_sdd_rehearsal.txt"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("deterministic competition rehearsal completed\n", encoding="utf-8")
+        changed.append(rel(root, output))
+    elif stage == "verify":
+        path = directory / "verify.md"
+        path.write_text(
+            "# Verification Report\n\n## Structural Validation\n\nPASS"
+            "\n\n## Requirement Traceability\n\nRequirement, implementation, and evidence are mapped."
+            "\n\n## Protected API and Scope\n\nPASS"
+            "\n\n## Dependency Integrity\n\nPASS"
+            "\n\n## Quality Gates\n\nConfigured commands are executed by the Runner."
+            "\n\n## Findings\n\nNone"
+            "\n\n## Decision\n\nPASS\n",
+            encoding="utf-8",
+        )
+        changed.append(rel(root, path))
+    elif stage == "review":
+        path = directory / "review.md"
+        path.write_text(
+            "# Independent Code Review\n\n## Scope Compliance\n\nPASS"
+            "\n\n## Specification Compliance\n\nPASS"
+            "\n\n## Clean Code Review\n\nPASS"
+            "\n\n## Test Quality\n\nPASS"
+            "\n\n## Findings\n\nNo blocking findings."
+            "\n\n## Decision\n\nPASS\n",
+            encoding="utf-8",
+        )
+        changed.append(rel(root, path))
+    elif stage == "finalize":
+        path = directory / "finalize.md"
+        path.write_text(
+            "# Finalize Receipt\n\n## Outcome\n\nPASS"
+            "\n\n## Repository State\n\nReady for deterministic archive."
+            "\n\n## Evidence\n\nSee `.sdd/evidence/` and stage handoffs."
+            "\n\n## Residual Risks\n\nNone\n\n## Archive Authorization\n\nAUTHORIZED\n",
+            encoding="utf-8",
+        )
+        changed.append(rel(root, path))
+    elif stage == "retrospective":
+        path = sdd_dir(root) / "changes" / state["change_id"] / "retrospective.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "# Retrospective\n\n## Delivered Outcome\n\nThe complete autonomous lifecycle closed."
+            "\n\n## Planned Path vs Actual Path\n\nThe deterministic path matched the lifecycle."
+            "\n\n## Failures and Recoveries\n\nNone."
+            "\n\n## Agent Compliance\n\nAll stage boundaries and handoffs were observed."
+            "\n\n## Quality Findings\n\nNo blocking findings."
+            "\n\n## Remaining Risks\n\nReal-model behavior remains for later validation."
+            "\n\n## Workflow Improvements\n\nUse this rehearsal as the control baseline.\n",
+            encoding="utf-8",
+        )
+        changed.append(rel(root, path))
+    else:
+        raise SddError(f"Fixture executor cannot execute stage: {stage}")
+    write_agent_result(root, f"Fixture completed {stage}", changed)
+
+
+def main_spec_from_delta(delta: str, capability: str) -> str:
+    body = re.sub(
+        r"^##\s+(ADDED|MODIFIED|REMOVED|RENAMED)\s+Requirements\s*$",
+        "## Requirements",
+        delta,
+        flags=re.MULTILINE,
+    )
+    if "## Requirements" not in body:
+        body = "## Requirements\n\n" + body
+    return f"# {capability.replace('-', ' ').title()}\n\n## Purpose\n\nVerified behavior delivered by the archived change.\n\n{body.strip()}\n"
+
+
+def perform_archive(root: Path, state: dict[str, Any]) -> None:
+    directory = change_dir(root, state)
+    if not directory.exists():
+        raise SddError(f"Active change directory is missing: {directory}")
+    for delta in sorted((directory / "specs").glob("*/spec.md")):
+        capability = delta.parent.name
+        target = root / "openspec" / "specs" / capability / "spec.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(main_spec_from_delta(delta.read_text(encoding="utf-8"), capability), encoding="utf-8")
+    archive = root / "openspec" / "changes" / "archive" / f"{dt.date.today().isoformat()}-{state['change_id']}"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    if archive.exists():
+        raise SddError(f"Archive already exists: {archive}")
+    shutil.move(str(directory), str(archive))
+    write_agent_result(
+        root,
+        "Runner synchronized main specs and archived the change",
+        [rel(root, archive), "openspec/specs/"],
+    )
+    append_journal(root, {"event": "change_archived", "archive": rel(root, archive)})
+
+
+def execute_stage(root: Path, state: dict[str, Any], dry_run: bool = False) -> None:
+    if state["stage"] == "archive" and not dry_run:
+        build_packet(root, state)
+        perform_archive(root, state)
+        return
+    invoke_agent(root, state, dry_run)
 
 
 def invoke_agent(root: Path, state: dict[str, Any], dry_run: bool) -> None:
@@ -432,6 +838,13 @@ def invoke_agent(root: Path, state: dict[str, Any], dry_run: bool) -> None:
         print(json.dumps(packet, indent=2, ensure_ascii=False))
         return
     config = load_config(root)
+    result_path = sdd_dir(root) / "runtime" / "agent-result.json"
+    if result_path.exists():
+        result_path.unlink()
+    if config.get("executor", "opencode") == "fixture":
+        fixture_execute(root, state)
+        append_journal(root, {"event": "fixture_finished", "stage": state["stage"]})
+        return
     command = [
         "opencode",
         "run",
@@ -506,7 +919,11 @@ def validate_stage_artifact(root: Path, state: dict[str, Any]) -> list[str]:
 
 def validate_controls(root: Path) -> list[str]:
     manifest = load_json(sdd_dir(root) / "baseline" / "manifest.json")
-    return verify_hashes(root, manifest["control_hashes"]) + verify_hashes(root, manifest["protected_files"])
+    return (
+        verify_hashes(root, manifest["control_hashes"])
+        + verify_hashes(root, manifest["protected_files"])
+        + verify_hashes(root, manifest["dependency_files"])
+    )
 
 
 def validate_scope(root: Path, stage: str) -> list[str]:
@@ -548,6 +965,19 @@ def execute_gates(root: Path, state: dict[str, Any]) -> tuple[list[str], list[di
     else:
         try:
             agent_result = load_json(result_path)
+            required = {
+                "status",
+                "summary",
+                "files_read",
+                "files_changed",
+                "commands_run",
+                "tests",
+                "deviations",
+                "blocking_reason",
+            }
+            missing = sorted(required - set(agent_result))
+            if missing:
+                errors.append("Agent result missing fields: " + ", ".join(missing))
             if agent_result.get("status") != "completed":
                 errors.append(f"Agent result status is not completed: {agent_result.get('status')}")
         except SddError as exc:
@@ -652,6 +1082,10 @@ def gate_and_advance(root: Path) -> None:
     completed = state["stage"]
     next_stage = next_stage_after(root, state)
     handoff = write_handoff(root, state, completed, next_stage, evidence)
+    if next_stage == "closed":
+        preview = dict(state)
+        preview["status"] = "closed"
+        emit_final_report(root, preview)
     commit = checkpoint(root, state, completed)
     state["stage"] = next_stage
     state["status"] = "closed" if next_stage == "closed" else "running"
@@ -670,7 +1104,7 @@ def run_once(args: argparse.Namespace) -> None:
     if state["status"] == "closed":
         print("Run is already closed")
         return
-    invoke_agent(root, state, args.dry_run)
+    execute_stage(root, state, args.dry_run)
     if not args.dry_run:
         gate_and_advance(root)
 
@@ -685,18 +1119,62 @@ def run_loop(args: argparse.Namespace) -> None:
     while steps < args.max_steps:
         state = load_state(root)
         if state["status"] in {"closed", "blocked"}:
+            if state["status"] == "closed" and not (sdd_dir(root) / "delivery-report.md").exists():
+                emit_final_report(root, state)
             print(json.dumps(state, indent=2, ensure_ascii=False))
             return
         try:
-            invoke_agent(root, state, False)
+            execute_stage(root, state, False)
             gate_and_advance(root)
-        except SddError:
+        except SddError as exc:
             state = load_state(root)
+            key = state["stage"]
+            if state["status"] != "repair_required":
+                state["retries"][key] = state["retries"].get(key, 0) + 1
+            maximum = load_json(sdd_dir(root) / "policy" / "autonomy.yaml")["retry"]["per_stage"]
+            if state["retries"].get(key, 0) > maximum:
+                state["status"] = "blocked"
+                state["blocking_reason"] = str(exc)
+            else:
+                state["status"] = "running"
+            save_state(root, state)
             if state["status"] == "blocked":
                 raise
-            append_journal(root, {"event": "repair_cycle_started", "stage": state["stage"]})
+            append_journal(
+                root,
+                {"event": "repair_cycle_started", "stage": state["stage"], "reason": str(exc)},
+            )
         steps += 1
-    raise SddError(f"Maximum runner steps reached: {args.max_steps}")
+    state = load_state(root)
+    state["status"] = "blocked"
+    state["blocking_reason"] = f"maximum runner steps reached: {args.max_steps}"
+    save_state(root, state)
+    raise SddError(state["blocking_reason"])
+
+
+def emit_final_report(root: Path, state: dict[str, Any]) -> Path:
+    report = sdd_dir(root) / "delivery-report.md"
+    handoffs = list((sdd_dir(root) / "changes" / state["change_id"] / "handoffs").glob("*.json"))
+    evidence = list((sdd_dir(root) / "evidence").glob("*.log"))
+    result_text = (
+        "The persisted state, archive, handoffs, and configured gates completed consistently."
+        if state["status"] == "closed"
+        else f"The run stopped safely. Blocking reason: `{state.get('blocking_reason', 'unknown')}`."
+    )
+    report.write_text(
+        "# Autonomous SDD Delivery Report\n\n"
+        f"- Outcome: `{state['status'].upper()}`\n"
+        f"- Change: `{state['change_id']}`\n"
+        f"- Objective: {state['objective']}\n"
+        f"- Baseline commit: `{state['baseline_commit']}`\n"
+        f"- Verified commit before final receipt: `{state['last_verified_commit']}`\n"
+        f"- Model selection: `{state.get('model_selection', 'unknown')}`\n"
+        f"- Stage handoffs: `{len(handoffs)}`\n"
+        f"- Evidence logs: `{len(evidence)}`\n\n"
+        f"## Result\n\n{result_text}\n",
+        encoding="utf-8",
+    )
+    return report
 
 
 def status(args: argparse.Namespace) -> None:
@@ -737,6 +1215,13 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("project")
     init.add_argument("--force", action="store_true")
     init.set_defaults(func=init_project)
+
+    competition = sub.add_parser("compete", help="Run the entire competition workflow with one command")
+    competition.add_argument("--task", required=True, help="Task file path or inline task text")
+    competition.add_argument("--change-id", help="Optional kebab-case change identifier")
+    competition.add_argument("--executor", choices=["opencode", "fixture"], default="opencode")
+    competition.add_argument("--max-steps", type=int, default=50)
+    competition.set_defaults(func=compete)
 
     sub.add_parser("doctor", help="Check required tools").set_defaults(func=doctor)
     sub.add_parser("baseline", help="Freeze policies and protected files").set_defaults(func=baseline)

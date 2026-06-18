@@ -27,6 +27,7 @@
         "tasks",
         "plan",
         "apply",
+        "review",
         "verify",
         "finalize",
         "archive",

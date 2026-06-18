@@ -61,6 +61,25 @@ artifacts:
       implementation steps, verification commands, and commit checkpoints.
     requires: [tasks]
 
+  - id: apply
+    generates: apply.md
+    description: Receipt proving task execution completed
+    template: apply.md
+    instruction: |
+      The external Runner creates this receipt after every implementation task
+      is checked and task-level gates pass.
+    requires: [plan]
+
+  - id: review
+    generates: review.md
+    description: Fresh-session specification and clean-code review
+    template: review.md
+    instruction: |
+      Review the implementation independently from the authoring session.
+      Check scope, specification semantics, architecture, readability, failure
+      handling, tests, and prohibited changes. Record blocking findings.
+    requires: [apply]
+
   - id: verify
     generates: verify.md
     description: Independent semantic and machine-evidence verification
@@ -68,7 +87,7 @@ artifacts:
     instruction: |
       Verify specification coverage, actual implementation, tests, policy,
       protected API, dependency, scope, and current Git evidence.
-    requires: [plan]
+    requires: [review]
 
   - id: finalize
     generates: finalize.md
