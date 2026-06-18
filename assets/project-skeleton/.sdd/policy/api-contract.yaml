@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "public_api": {
+    "compatibility": "exact",
+    "protected_paths": [
+      "provided-api/**",
+      "grader/**"
+    ],
+    "protected_symbols": [],
+    "forbidden_changes": [
+      "remove_or_rename_type",
+      "change_package",
+      "reduce_visibility",
+      "change_method_signature",
+      "change_serialized_field",
+      "change_protocol_value"
+    ]
+  }
+}

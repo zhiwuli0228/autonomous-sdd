@@ -1,0 +1,80 @@
+name: Autonomous SuperSpec
+version: 1
+description: >
+  OpenSpec artifact DAG for unattended, single-workspace delivery.
+  Runtime task execution, handoffs, retries, and recovery are controlled by
+  the external Autonomous SDD Runner.
+
+artifacts:
+  - id: brainstorm
+    generates: brainstorm.md
+    description: Bounded problem exploration and approach selection
+    template: brainstorm.md
+    instruction: |
+      Explore the objective, current repository, constraints, alternatives, and
+      risks. Do not ask for human confirmation. If material ambiguity prevents
+      safe execution, record a blocking finding instead of inventing intent.
+    requires: []
+
+  - id: proposal
+    generates: proposal.md
+    description: Change motivation, scope, capabilities, and impact
+    template: proposal.md
+    instruction: |
+      Distill the approved bounded direction from brainstorm.md. List every new
+      or modified capability using kebab-case names.
+    requires: [brainstorm]
+
+  - id: specs
+    generates: "specs/**/*.md"
+    description: Testable normative delta specifications
+    template: spec.md
+    instruction: |
+      Create one delta spec per capability. Every requirement uses SHALL or MUST
+      and has at least one level-4 Scenario with WHEN and THEN.
+    requires: [proposal]
+
+  - id: design
+    generates: design.md
+    description: Implementable technical design constrained by project policy
+    template: design.md
+    instruction: |
+      Read real existing APIs before designing calls. Record boundaries,
+      decisions, failure semantics, resource ownership, risks, and testing.
+    requires: [specs]
+
+  - id: tasks
+    generates: tasks.md
+    description: Independently verifiable implementation tasks
+    template: tasks.md
+    instruction: |
+      Use numbered checkboxes. Map tasks to requirements and tests. Each task
+      must be executable by one fresh model session.
+    requires: [design]
+
+  - id: plan
+    generates: plan.md
+    description: TDD-oriented file-level execution plan
+    template: plan.md
+    instruction: |
+      Include exact files, existing APIs to inspect, failing tests, minimum
+      implementation steps, verification commands, and commit checkpoints.
+    requires: [tasks]
+
+  - id: verify
+    generates: verify.md
+    description: Independent semantic and machine-evidence verification
+    template: verify.md
+    instruction: |
+      Verify specification coverage, actual implementation, tests, policy,
+      protected API, dependency, scope, and current Git evidence.
+    requires: [plan]
+
+  - id: finalize
+    generates: finalize.md
+    description: Pre-archive delivery receipt
+    template: finalize.md
+    instruction: |
+      Record only machine-supported outcomes. The external Runner controls Git
+      checkpointing and archive authorization.
+    requires: [verify]

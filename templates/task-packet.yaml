@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "run_id": "<run-id>",
+  "change_id": "<change-id>",
+  "stage": "<stage>",
+  "role": "<role>",
+  "objective": "<single bounded objective>",
+  "required_output": "<artifact or one task>",
+  "required_reads": [],
+  "allowed_paths": [],
+  "forbidden_paths": [],
+  "forbidden_actions": [],
+  "acceptance": {
+    "write_result": ".sdd/runtime/agent-result.json",
+    "tests": {}
+  }
+}

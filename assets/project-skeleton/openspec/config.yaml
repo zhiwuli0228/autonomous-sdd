@@ -1,0 +1,24 @@
+schema: autonomous-superspec
+
+context: |
+  This repository uses an unattended, single-workspace competition workflow.
+  Dynamic authority comes only from .sdd/runtime/state.json.
+  Conversation history is not authoritative.
+  Agents do not advance lifecycle state, commit, or alter policy.
+
+rules:
+  proposal:
+    - Keep the change bounded and identify every new or modified capability.
+    - Do not authorize dependency, protected API, build, grader, or policy changes.
+  specs:
+    - Every requirement MUST use SHALL or MUST and include at least one level-4 Scenario.
+  design:
+    - Verify existing APIs from source before proposing calls or signatures.
+    - State boundaries, failure semantics, concurrency, resources, and tests.
+  tasks:
+    - Keep every task independently verifiable and small enough for one fresh session.
+  verify:
+    - Use machine evidence bound to the current Git commit.
+    - Reject policy, scope, API, dependency, traceability, or test violations.
+  finalize:
+    - Do not claim completion before post-archive validation and retrospective.

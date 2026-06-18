@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "execution": {
+    "human_intervention": "forbidden_after_start",
+    "network_access": "forbidden",
+    "worktrees": "forbidden",
+    "parallel_writers": "forbidden"
+  },
+  "modification": {
+    "mode": "allowlist",
+    "allowed": [
+      "src/**",
+      "test/**",
+      "tests/**",
+      "openspec/changes/**",
+      "openspec/specs/**",
+      ".sdd/runtime/**",
+      ".sdd/evidence/**",
+      ".sdd/changes/**"
+    ],
+    "forbidden": [
+      ".git/**",
+      ".sdd/policy/**",
+      ".sdd/baseline/**",
+      ".sdd/bin/**",
+      "openspec/schemas/**",
+      "grader/**",
+      "evaluation/**",
+      "fixtures/official/**"
+    ]
+  },
+  "dependencies": {
+    "changes": "forbidden",
+    "manifest_paths": [
+      "pom.xml",
+      "build.gradle",
+      "settings.gradle",
+      "package.json",
+      "package-lock.json",
+      "pnpm-lock.yaml",
+      "yarn.lock",
+      "pyproject.toml",
+      "requirements*.txt",
+      "go.mod",
+      "Cargo.toml"
+    ]
+  },
+  "limits": {
+    "maximum_changed_files": 50,
+    "maximum_agent_invocations": 100
+  }
+}

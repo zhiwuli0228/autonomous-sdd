@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "change_boundaries": {
+    "allowed": [
+      "src/**",
+      "test/**",
+      "tests/**"
+    ],
+    "forbidden": [],
+    "maximum_changed_files": 50
+  },
+  "architecture": {
+    "preserve_existing_boundaries": true,
+    "cycles": "forbidden",
+    "global_mutable_state": "forbidden",
+    "silent_exception_handling": "forbidden"
+  }
+}

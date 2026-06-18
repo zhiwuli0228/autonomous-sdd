@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "commands": {
+    "diff_check": ["git", "diff", "--check"],
+    "openspec_validate": ["openspec.cmd", "validate", "--all", "--json"],
+    "project_test": []
+  },
+  "task_gate": [
+    "diff_check",
+    "project_test"
+  ],
+  "full_gate": [
+    "diff_check",
+    "openspec_validate",
+    "project_test"
+  ]
+}

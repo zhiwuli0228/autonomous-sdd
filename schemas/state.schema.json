@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonomous-sdd.local/state.schema.json",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "change_id",
+    "objective",
+    "stage",
+    "status",
+    "baseline_commit",
+    "last_verified_commit",
+    "next_action"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "change_id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+    "objective": {"type": "string", "minLength": 10},
+    "stage": {
+      "enum": [
+        "brainstorm",
+        "proposal",
+        "specs",
+        "design",
+        "tasks",
+        "plan",
+        "apply",
+        "verify",
+        "finalize",
+        "archive",
+        "retrospective",
+        "closed"
+      ]
+    },
+    "status": {"enum": ["running", "repair_required", "blocked", "closed"]},
+    "iteration": {"type": "integer", "minimum": 0},
+    "baseline_commit": {"type": "string"},
+    "last_verified_commit": {"type": "string"},
+    "last_handoff": {"type": ["string", "null"]},
+    "next_action": {"type": "string"},
+    "retries": {"type": "object"}
+  },
+  "additionalProperties": true
+}

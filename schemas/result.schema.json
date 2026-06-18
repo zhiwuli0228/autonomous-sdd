@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonomous-sdd.local/result.schema.json",
+  "type": "object",
+  "required": [
+    "status",
+    "summary",
+    "files_read",
+    "files_changed",
+    "commands_run",
+    "tests",
+    "deviations",
+    "blocking_reason"
+  ],
+  "properties": {
+    "status": {"enum": ["completed", "failed", "blocked"]},
+    "summary": {"type": "string"},
+    "files_read": {"type": "array", "items": {"type": "string"}},
+    "files_changed": {"type": "array", "items": {"type": "string"}},
+    "commands_run": {"type": "array"},
+    "tests": {"type": "array"},
+    "deviations": {"type": "array"},
+    "blocking_reason": {"type": ["string", "null"]}
+  },
+  "additionalProperties": false
+}

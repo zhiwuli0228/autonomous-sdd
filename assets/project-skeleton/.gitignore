@@ -1,0 +1,8 @@
+# Autonomous SDD machine-local state
+.sdd/runtime/
+.sdd/evidence/
+.sdd/baseline/
+.sdd/bin/
+
+# OpenCode session-local storage
+.opencode/storage/

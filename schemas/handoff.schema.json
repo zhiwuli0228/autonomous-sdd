@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonomous-sdd.local/handoff.schema.json",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "handoff_id",
+    "run_id",
+    "change_id",
+    "completed_stage",
+    "next_stage",
+    "repository",
+    "artifacts",
+    "evidence",
+    "blocking_findings",
+    "next_action"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "handoff_id": {"type": "string"},
+    "run_id": {"type": "string"},
+    "change_id": {"type": "string"},
+    "completed_stage": {"type": "string"},
+    "next_stage": {"type": "string"},
+    "repository": {
+      "type": "object",
+      "required": ["commit_before_checkpoint", "changed_files"]
+    },
+    "artifacts": {"type": "object"},
+    "evidence": {"type": "array"},
+    "blocking_findings": {"type": "array"},
+    "residual_risks": {"type": "array"},
+    "next_action": {"type": "string"}
+  },
+  "additionalProperties": true
+}

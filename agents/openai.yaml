@@ -1,0 +1,4 @@
+interface:
+  display_name: "Autonomous SDD"
+  short_description: "Unattended OpenSpec-driven delivery orchestration"
+  default_prompt: "Use $autonomous-sdd to initialize and run an unattended spec-driven delivery workflow."

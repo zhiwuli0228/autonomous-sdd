@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "general": {
+    "preserve_existing_style": true,
+    "minimal_coherent_change": true,
+    "speculative_abstraction": "forbidden",
+    "dead_code": "forbidden",
+    "commented_out_code": "forbidden",
+    "placeholder_implementation": "forbidden",
+    "todo_in_production": "forbidden"
+  },
+  "design": {
+    "single_responsibility": "required",
+    "explicit_failure_semantics": "required",
+    "dependency_direction": "required",
+    "resource_ownership": "required_when_applicable"
+  },
+  "testing": {
+    "new_behavior_requires_tests": true,
+    "bug_fix_requires_regression_test": true,
+    "flaky_retry_as_fix": "forbidden",
+    "sleep_based_synchronization": "forbidden"
+  }
+}

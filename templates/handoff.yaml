@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "handoff_id": "<sequence-stage-to-stage>",
+  "run_id": "<run-id>",
+  "change_id": "<change-id>",
+  "completed_stage": "<stage>",
+  "next_stage": "<stage>",
+  "repository": {
+    "commit_before_checkpoint": "<sha>",
+    "changed_files": []
+  },
+  "artifacts": {},
+  "evidence": [],
+  "blocking_findings": [],
+  "residual_risks": [],
+  "next_action": "<exact action>"
+}

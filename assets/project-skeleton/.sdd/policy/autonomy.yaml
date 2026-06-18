@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "ambiguity": "stop",
+  "scope_expansion": "deny",
+  "new_dependency": "deny",
+  "breaking_api": "deny",
+  "architecture_change": "deny_unless_designed",
+  "retry": {
+    "per_stage": 3,
+    "total": 12
+  },
+  "failure": {
+    "inconsistent_repository": "stop",
+    "policy_violation": "stop_and_restore_checkpoint",
+    "verification_failure": "repair_within_budget"
+  }
+}

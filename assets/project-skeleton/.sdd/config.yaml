@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "distribution_version": "0.1.0",
+  "model": "internal/deepseek-v4-flash",
+  "git": {
+    "auto_commit": true
+  },
+  "timeouts": {
+    "agent_seconds": 1200,
+    "verification_seconds": 3600
+  }
+}
