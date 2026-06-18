@@ -24,6 +24,10 @@ Start and run a change:
 
 On Windows use `sdd.cmd`.
 
+The Runner does not pass `--model` by default, so OpenCode uses the model
+provided by the internal environment. Set `.sdd/config.yaml` `model` only when
+an explicit provider/model ID is guaranteed.
+
 ## Required operating rules
 
 1. Use one working tree and one writer.

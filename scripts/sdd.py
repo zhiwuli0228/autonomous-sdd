@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 STAGES = [
     "brainstorm",
     "proposal",
@@ -321,6 +321,7 @@ def start(args: argparse.Namespace) -> None:
         "last_verified_commit": git_head(root),
         "last_handoff": None,
         "next_action": "execute_stage",
+        "model_selection": load_config(root).get("model") or "opencode-default",
         "retries": {},
         "created_at": now(),
     }
@@ -431,12 +432,9 @@ def invoke_agent(root: Path, state: dict[str, Any], dry_run: bool) -> None:
         print(json.dumps(packet, indent=2, ensure_ascii=False))
         return
     config = load_config(root)
-    model = config["model"]
     command = [
         "opencode",
         "run",
-        "--model",
-        model,
         "--format",
         "json",
         "--dir",
@@ -445,6 +443,9 @@ def invoke_agent(root: Path, state: dict[str, Any], dry_run: bool) -> None:
         f"sdd-{state['change_id']}-{state['stage']}",
         prompt_for(packet),
     ]
+    model = config.get("model")
+    if model:
+        command[2:2] = ["--model", model]
     timeout = int(config["timeouts"]["agent_seconds"])
     result = run_command(command, root, timeout=timeout)
     evidence = write_evidence(root, f"{state['stage']}-{state['iteration']}-agent", command, result)

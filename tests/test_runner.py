@@ -59,7 +59,8 @@ class RunnerSmokeTest(unittest.TestCase):
         packet = json.loads(output)
         self.assertEqual("brainstorm", packet["stage"])
         self.assertEqual("sample-change", packet["change_id"])
-        self.assertTrue((self.project / ".sdd" / "runtime" / "state.json").exists())
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual("opencode-default", state["model_selection"])
 
     def test_policy_tampering_breaks_recovery(self) -> None:
         run("--project", str(self.project), "baseline")
