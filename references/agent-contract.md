@@ -19,7 +19,9 @@ The agent must:
 2. Modify only allowed paths.
 3. Preserve protected APIs and dependency manifests.
 4. For implementation, demonstrate test failure before production changes when feasible.
-5. Write `.sdd/runtime/agent-result.json`.
-6. Never commit, advance state, archive, or alter policy.
+5. For implementation, return the exact packet `task_id` and do not edit task checkboxes.
+6. Write `.sdd/runtime/agent-result.json`.
+7. Never commit, advance state, archive, or alter policy.
 
-The Runner independently verifies every claim. Missing or malformed result data is a failed invocation, not proof of failure or success.
+The Runner independently verifies every claim and owns task completion markers.
+Missing or malformed result data is a failed invocation, not proof of failure or success.

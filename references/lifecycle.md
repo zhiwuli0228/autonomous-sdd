@@ -12,7 +12,7 @@
 | proposal | `proposal.md` | Why, What Changes, Capabilities, Impact present |
 | specs | `specs/*/spec.md` | normative requirement and scenario present |
 | design | `design.md` | boundaries, existing API verification, decisions, tests present |
-| tasks | `tasks.md` | numbered unchecked task list present |
+| tasks | `tasks.md` | 3-20 stable numbered top-level tasks; no nested checkboxes |
 | plan | `plan.md` | exact files, tests, task ordering, commit points present |
 | apply | source/test changes and checked tasks | task test passes, scope/API/policy guards pass |
 | review | `review.md` | fresh-session scope, specification, tests, and clean-code review pass |

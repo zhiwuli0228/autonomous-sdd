@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "sdd.py"
+SPEC = importlib.util.spec_from_file_location("autonomous_sdd_runner", RUNNER)
+assert SPEC and SPEC.loader
+SDD = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(SDD)
 
 
 def run(*args: str, cwd: Path | None = None, expected: int = 0) -> subprocess.CompletedProcess[str]:
@@ -167,6 +173,93 @@ class RunnerSmokeTest(unittest.TestCase):
         api.write_text("public interface StableApi { void changed(); }\n", encoding="utf-8")
         result = run("--project", str(self.project), "recover", expected=2)
         self.assertIn("changed:src/main/java/sample/api/StableApi.java", result.stdout)
+
+    def test_task_gate_rejects_nested_checkbox_explosion(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "task-shape",
+            "Verify bounded task decomposition before unattended implementation",
+        )
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        state["stage"] = "tasks"
+        (self.project / ".sdd" / "runtime" / "state.json").write_text(
+            json.dumps(state, indent=2) + "\n", encoding="utf-8"
+        )
+        tasks = self.project / "openspec" / "changes" / "task-shape" / "tasks.md"
+        tasks.write_text(
+            "# Tasks\n\n- [ ] 1.1 Coherent task\n- [ ] nested micro task\n",
+            encoding="utf-8",
+        )
+        errors = SDD.validate_stage_artifact(self.project, state)
+        self.assertTrue(any("3-20" in error for error in errors))
+        self.assertTrue(any("unnumbered" in error for error in errors))
+
+    def test_runner_marks_exact_apply_task_after_gate(self) -> None:
+        run(
+            "--project",
+            str(self.project),
+            "compete",
+            "--task",
+            "Exercise runner-owned exact apply task completion",
+            "--change-id",
+            "task-ownership",
+            "--executor",
+            "fixture",
+            "--max-steps",
+            "30",
+        )
+        archive = next((self.project / "openspec" / "changes" / "archive").glob("*-task-ownership"))
+        tasks = (archive / "tasks.md").read_text(encoding="utf-8")
+        self.assertNotIn("- [ ]", tasks)
+        self.assertIn("- [x] 1.1", tasks)
+        self.assertIn("- [x] 1.2", tasks)
+
+    def test_timeout_terminates_descendant_process(self) -> None:
+        marker = self.temp / "descendant-survived.txt"
+        child = (
+            "import time; from pathlib import Path; "
+            f"time.sleep(1.5); Path({str(marker)!r}).write_text('survived')"
+        )
+        parent = (
+            "import subprocess,sys,time; "
+            f"subprocess.Popen([sys.executable,'-c',{child!r}]); time.sleep(30)"
+        )
+        with self.assertRaises(subprocess.TimeoutExpired):
+            SDD.run_command([sys.executable, "-c", parent], self.project, timeout=1)
+        time.sleep(2)
+        self.assertFalse(marker.exists(), "descendant process survived command timeout")
+
+    def test_migrate_legacy_nested_tasks_to_bounded_tasks(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "legacy-tasks",
+            "Recover a legacy task file without losing implementation details",
+        )
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        state["stage"] = "apply"
+        (self.project / ".sdd" / "runtime" / "state.json").write_text(
+            json.dumps(state, indent=2) + "\n", encoding="utf-8"
+        )
+        tasks = self.project / "openspec" / "changes" / "legacy-tasks" / "tasks.md"
+        tasks.write_text(
+            "# Tasks\n\n"
+            "## 1. First capability\n\n### 1.1 Detail\n- [ ] implement first\n- [ ] test first\n\n"
+            "## 2. Second capability\n\n- [ ] implement second\n\n"
+            "## 3. Verification\n\n- [ ] verify all\n",
+            encoding="utf-8",
+        )
+        run("--project", str(self.project), "migrate-tasks")
+        migrated = tasks.read_text(encoding="utf-8")
+        self.assertEqual(3, migrated.count("- [ ] "))
+        self.assertIn("- [ ] 1.1 First capability", migrated)
+        self.assertIn("  - implement first", migrated)
+        self.assertNotIn("- [ ] implement first", migrated)
 
 
 if __name__ == "__main__":

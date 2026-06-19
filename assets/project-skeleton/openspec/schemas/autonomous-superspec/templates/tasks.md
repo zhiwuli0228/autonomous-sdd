@@ -2,11 +2,17 @@
 
 ## 1. Implementation
 
-- [ ] 1.1 Add a focused failing test mapped to a spec scenario
-- [ ] 1.2 Implement the minimum coherent production change
-- [ ] 1.3 Refactor while preserving green tests and project style
+- [ ] 1.1 Implement one coherent capability slice with focused tests
+  - Map the slice to explicit spec scenarios.
+  - Keep production and test work in the same task.
+- [ ] 1.2 Implement the next coherent capability slice with focused tests
+  - Use plain bullets for acceptance details; never create nested checkboxes.
+- [ ] 1.3 Integrate the capability slices and remove duplication
 
 ## 2. Verification
 
-- [ ] 2.1 Run focused and full configured quality gates
-- [ ] 2.2 Verify protected API, dependency, scope, and traceability constraints
+- [ ] 2.1 Add or complete bounded integration tests
+- [ ] 2.2 Resolve clean-code and traceability findings
+
+Create 3-20 numbered top-level tasks total. Every task MUST match `- [ ] N.N Title`.
+Use plain nested bullets for details. Do not create any other checkbox.

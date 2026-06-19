@@ -20,7 +20,8 @@
     "commands_run": {"type": "array"},
     "tests": {"type": "array"},
     "deviations": {"type": "array"},
-    "blocking_reason": {"type": ["string", "null"]}
+    "blocking_reason": {"type": ["string", "null"]},
+    "task_id": {"type": ["string", "null"], "pattern": "^\\d+\\.\\d+$"}
   },
   "additionalProperties": false
 }

@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -23,7 +24,9 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
+MIN_APPLY_TASKS = 3
+MAX_APPLY_TASKS = 20
 STAGES = [
     "brainstorm",
     "proposal",
@@ -110,7 +113,7 @@ def run_command(
     executable = shutil.which(args[0])
     if executable:
         args = [executable, *args[1:]]
-    result = subprocess.run(
+    process = subprocess.Popen(
         args,
         cwd=cwd,
         text=True,
@@ -118,12 +121,42 @@ def run_command(
         errors="replace",
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.STDOUT if capture else None,
-        timeout=timeout,
         shell=False,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        start_new_session=os.name != "nt",
     )
+    try:
+        stdout, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        terminate_process_tree(process)
+        stdout, _ = process.communicate()
+        raise subprocess.TimeoutExpired(args, timeout, output=stdout)
+    result = subprocess.CompletedProcess(args, process.returncode, stdout, None)
     if check and result.returncode != 0:
         raise SddError(f"Command failed ({result.returncode}): {' '.join(args)}\n{result.stdout or ''}")
     return result
+
+
+def terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 def project_root(value: str | None) -> Path:
@@ -551,11 +584,77 @@ def artifact_for(root: Path, state: dict[str, Any], stage: str) -> Path | None:
     return None
 
 
-def unchecked_tasks(root: Path, state: dict[str, Any]) -> list[str]:
+def task_entries(root: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
     path = change_dir(root, state) / "tasks.md"
     if not path.exists():
         return []
-    return re.findall(r"^- \[ \] (.+)$", path.read_text(encoding="utf-8"), flags=re.MULTILINE)
+    entries = []
+    pattern = re.compile(r"^- \[(?P<mark>[ xX])\] (?P<id>\d+\.\d+) (?P<title>.+)$", re.MULTILINE)
+    for match in pattern.finditer(path.read_text(encoding="utf-8")):
+        entries.append(
+            {
+                "id": match.group("id"),
+                "title": match.group("title").strip(),
+                "completed": match.group("mark").lower() == "x",
+            }
+        )
+    return entries
+
+
+def unchecked_tasks(root: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
+    return [entry for entry in task_entries(root, state) if not entry["completed"]]
+
+
+def current_task(root: Path, state: dict[str, Any]) -> dict[str, Any] | None:
+    tasks = unchecked_tasks(root, state)
+    return tasks[0] if tasks else None
+
+
+def complete_task(root: Path, state: dict[str, Any], task_id: str) -> None:
+    path = change_dir(root, state) / "tasks.md"
+    text = path.read_text(encoding="utf-8")
+    pattern = re.compile(rf"^- \[ \] {re.escape(task_id)} (?P<title>.+)$", re.MULTILINE)
+    updated, count = pattern.subn(rf"- [x] {task_id} \g<title>", text, count=1)
+    if count != 1:
+        raise SddError(f"Runner could not complete apply task {task_id}")
+    path.write_text(updated, encoding="utf-8")
+
+
+def migrate_tasks(args: argparse.Namespace) -> None:
+    root = project_root(args.project)
+    state = load_state(root)
+    path = change_dir(root, state) / "tasks.md"
+    text = path.read_text(encoding="utf-8")
+    if task_entries(root, state) and not re.search(r"^- \[[ xX]\] (?!\d+\.\d+ )", text, re.MULTILINE):
+        print("Task file already uses the bounded task format")
+        return
+    section_pattern = re.compile(r"^## (?P<number>\d+)\. (?P<title>.+)$", re.MULTILINE)
+    matches = list(section_pattern.finditer(text))
+    if not matches:
+        raise SddError("Cannot migrate tasks.md: no numbered level-2 task sections found")
+    prefix = text[: matches[0].start()]
+    rebuilt = [prefix.rstrip(), ""]
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[match.end() : end].strip()
+        body = re.sub(r"^- \[[ xX]\] ", "  - ", body, flags=re.MULTILINE)
+        rebuilt.extend(
+            [
+                match.group(0),
+                "",
+                f"- [ ] {match.group('number')}.1 {match.group('title').strip()}",
+                "",
+                body,
+                "",
+            ]
+        )
+    migrated = "\n".join(rebuilt).rstrip() + "\n"
+    path.write_text(migrated, encoding="utf-8")
+    tasks = task_entries(root, state)
+    if len(tasks) < MIN_APPLY_TASKS or len(tasks) > MAX_APPLY_TASKS:
+        raise SddError(f"Migrated task count must be {MIN_APPLY_TASKS}-{MAX_APPLY_TASKS}; found {len(tasks)}")
+    append_journal(root, {"event": "tasks_migrated", "task_count": len(tasks)})
+    print(f"Migrated legacy task file to {len(tasks)} bounded tasks")
 
 
 def required_output(root: Path, state: dict[str, Any]) -> str:
@@ -563,8 +662,12 @@ def required_output(root: Path, state: dict[str, Any]) -> str:
     if stage == "specs":
         return f"openspec/changes/{state['change_id']}/specs/<capability>/spec.md"
     if stage == "apply":
-        tasks = unchecked_tasks(root, state)
-        return f"complete exactly one task: {tasks[0] if tasks else 'write apply.md receipt'}"
+        task = current_task(root, state)
+        return (
+            f"complete exactly task {task['id']}: {task['title']}"
+            if task
+            else "write apply.md receipt"
+        )
     if stage == "archive":
         return f"archive and sync change {state['change_id']}"
     if stage == "closed":
@@ -644,6 +747,7 @@ def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
         "role": "implementation" if stage == "apply" else stage,
         "objective": state["objective"],
         "required_output": required_output(root, state),
+        "task_id": current_task(root, state)["id"] if stage == "apply" and current_task(root, state) else None,
         "required_reads": stage_required_reads(root, state),
         "allowed_paths": allowed,
         "forbidden_paths": sorted(
@@ -677,13 +781,15 @@ def prompt_for(packet: dict[str, Any]) -> str:
         "Do not commit or change lifecycle state. Do not modify policy, baseline, runner, schema, "
         "dependency manifests, protected API, or forbidden paths. "
         "Write .sdd/runtime/agent-result.json using status, summary, files_read, files_changed, "
-        "commands_run, tests, deviations, and blocking_reason. "
+        "commands_run, tests, deviations, blocking_reason, and task_id. "
+        "For apply, task_id must exactly match the packet and you must not edit task checkboxes; "
+        "the Runner owns task completion state. "
         "Do not ask questions; if essential intent is ambiguous, return status blocked with the exact reason. "
         f"Current stage: {packet['stage']}. Required output: {packet['required_output']}."
     )
 
 
-def write_agent_result(root: Path, summary: str, changed: list[str]) -> None:
+def write_agent_result(root: Path, summary: str, changed: list[str], task_id: str | None = None) -> None:
     atomic_json(
         sdd_dir(root) / "runtime" / "agent-result.json",
         {
@@ -695,6 +801,7 @@ def write_agent_result(root: Path, summary: str, changed: list[str]) -> None:
             "tests": [],
             "deviations": [],
             "blocking_reason": None,
+            "task_id": task_id,
         },
     )
 
@@ -761,7 +868,8 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
         path.write_text(
             "# Tasks\n\n## 1. Implementation\n\n"
             "- [ ] 1.1 Implement the bounded sample behavior and focused evidence\n"
-            "- [ ] 1.2 Verify the implementation and clean-code constraints\n",
+            "- [ ] 1.2 Add bounded integration evidence\n"
+            "- [ ] 1.3 Verify the implementation and clean-code constraints\n",
             encoding="utf-8",
         )
         changed.append(rel(root, path))
@@ -776,16 +884,10 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
         )
         changed.append(rel(root, path))
     elif stage == "apply":
-        tasks_path = directory / "tasks.md"
-        text = tasks_path.read_text(encoding="utf-8")
-        match = re.search(r"^- \[ \] (.+)$", text, flags=re.MULTILINE)
-        if match:
-            text = text[: match.start()] + f"- [x] {match.group(1)}" + text[match.end() :]
-            tasks_path.write_text(text, encoding="utf-8")
-            changed.append(rel(root, tasks_path))
-        output = root / "src" / "autonomous_sdd_rehearsal.txt"
+        task = current_task(root, state)
+        output = root / "src" / f"autonomous_sdd_rehearsal_{task['id'].replace('.', '_')}.txt"
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text("deterministic competition rehearsal completed\n", encoding="utf-8")
+        output.write_text(f"deterministic competition rehearsal task {task['id']} completed\n", encoding="utf-8")
         changed.append(rel(root, output))
     elif stage == "verify":
         path = directory / "verify.md"
@@ -838,7 +940,8 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
         changed.append(rel(root, path))
     else:
         raise SddError(f"Fixture executor cannot execute stage: {stage}")
-    write_agent_result(root, f"Fixture completed {stage}", changed)
+    task = current_task(root, state) if stage == "apply" else None
+    write_agent_result(root, f"Fixture completed {stage}", changed, task["id"] if task else None)
 
 
 def main_spec_from_delta(delta: str, capability: str) -> str:
@@ -945,8 +1048,18 @@ def validate_stage_artifact(root: Path, state: dict[str, Any]) -> list[str]:
         artifact = directory / "tasks.md"
         if not artifact.exists():
             return ["Missing tasks.md"]
-        if not re.search(r"^- \[ \] \d+\.\d+ .+", artifact.read_text(encoding="utf-8"), re.MULTILINE):
+        text = artifact.read_text(encoding="utf-8")
+        tasks = task_entries(root, state)
+        if not tasks:
             errors.append("tasks.md contains no numbered unchecked task")
+        if len(tasks) < MIN_APPLY_TASKS or len(tasks) > MAX_APPLY_TASKS:
+            errors.append(f"tasks.md must contain {MIN_APPLY_TASKS}-{MAX_APPLY_TASKS} bounded tasks; found {len(tasks)}")
+        unnumbered = re.findall(r"^- \[[ xX]\] (?!\d+\.\d+ ).+$", text, re.MULTILINE)
+        if unnumbered:
+            errors.append("tasks.md contains unnumbered or nested checkbox tasks")
+        ids = [task["id"] for task in tasks]
+        if len(ids) != len(set(ids)):
+            errors.append("tasks.md contains duplicate task IDs")
         return errors
     if stage == "apply":
         return errors
@@ -1038,8 +1151,24 @@ def execute_gates(root: Path, state: dict[str, Any]) -> tuple[list[str], list[di
                 errors.append("Agent result missing fields: " + ", ".join(missing))
             if agent_result.get("status") != "completed":
                 errors.append(f"Agent result status is not completed: {agent_result.get('status')}")
+            if stage == "apply":
+                task = current_task(root, state)
+                if task is None:
+                    errors.append("No current apply task exists")
+                elif agent_result.get("task_id") != task["id"]:
+                    errors.append(
+                        f"Agent result task_id mismatch: expected {task['id']}, got {agent_result.get('task_id')}"
+                    )
         except SddError as exc:
             errors.append(str(exc))
+    if stage == "apply":
+        substantive = [
+            path
+            for path in git_changed(root)
+            if not path.startswith(("openspec/", ".sdd/"))
+        ]
+        if not substantive:
+            errors.append("Apply task made no substantive source or test change")
     evidence: list[dict[str, Any]] = []
     should_test = stage in {"apply", "review", "verify", "finalize", "archive"}
     if should_test:
@@ -1124,6 +1253,7 @@ def next_stage_after(root: Path, state: dict[str, Any]) -> str:
 
 def gate_and_advance(root: Path) -> None:
     state = load_state(root)
+    completed_task = current_task(root, state) if state["stage"] == "apply" else None
     errors, evidence = execute_gates(root, state)
     if errors:
         state["status"] = "repair_required"
@@ -1137,6 +1267,12 @@ def gate_and_advance(root: Path) -> None:
             state["blocking_reason"] = "retry_budget_exhausted"
             save_state(root, state)
         raise SddError("Gate failed:\n- " + "\n- ".join(errors))
+    if completed_task:
+        complete_task(root, state, completed_task["id"])
+        append_journal(
+            root,
+            {"event": "apply_task_completed", "task_id": completed_task["id"], "title": completed_task["title"]},
+        )
     completed = state["stage"]
     next_stage = next_stage_after(root, state)
     handoff = write_handoff(root, state, completed, next_stage, evidence)
@@ -1301,6 +1437,9 @@ def parser() -> argparse.ArgumentParser:
 
     sub.add_parser("status", help="Print machine state").set_defaults(func=status)
     sub.add_parser("recover", help="Validate and recover a run").set_defaults(func=recover)
+    sub.add_parser("migrate-tasks", help="Collapse legacy nested checkboxes into bounded tasks").set_defaults(
+        func=migrate_tasks
+    )
     return result
 
 

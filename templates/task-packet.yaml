@@ -6,6 +6,7 @@
   "role": "<role>",
   "objective": "<single bounded objective>",
   "required_output": "<artifact or one task>",
+  "task_id": "<N.N for apply, otherwise null>",
   "required_reads": [],
   "allowed_paths": [],
   "forbidden_paths": [],

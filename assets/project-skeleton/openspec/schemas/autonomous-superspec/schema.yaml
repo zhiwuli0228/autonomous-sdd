@@ -48,8 +48,10 @@ artifacts:
     description: Independently verifiable implementation tasks
     template: tasks.md
     instruction: |
-      Use numbered checkboxes. Map tasks to requirements and tests. Each task
-      must be executable by one fresh model session.
+      Create 3-20 coherent numbered top-level checkbox tasks. Map each task to
+      requirements and tests, keep acceptance details as plain nested bullets,
+      and never create nested checkboxes. Each task must be executable by one
+      fresh model session.
     requires: [design]
 
   - id: plan
