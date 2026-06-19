@@ -99,6 +99,7 @@ class RunnerSmokeTest(unittest.TestCase):
         self.assertIn("RESULT=CLOSED", result.stdout)
         state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
         self.assertEqual("closed", state["status"])
+        self.assertEqual({}, state["retries"])
         self.assertTrue((self.project / ".sdd" / "delivery-report.md").exists())
         archives = list((self.project / "openspec" / "changes" / "archive").glob("*-complete-rehearsal"))
         self.assertEqual(1, len(archives))

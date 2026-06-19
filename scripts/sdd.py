@@ -1287,6 +1287,7 @@ def gate_and_advance(root: Path) -> None:
     state["last_handoff"] = rel(root, handoff)
     state["next_action"] = "emit_final_report" if next_stage == "closed" else "execute_stage"
     state["iteration"] += 1
+    state["retries"].pop(completed, None)
     save_state(root, state)
     append_journal(root, {"event": "stage_advanced", "from": completed, "to": next_stage, "commit": commit})
     print(f"PASS {completed} -> {next_stage} at {commit}")
