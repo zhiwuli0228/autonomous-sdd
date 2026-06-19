@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import errno
 import fnmatch
 import hashlib
 import json
@@ -20,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -189,6 +191,125 @@ def load_config(root: Path) -> dict[str, Any]:
 
 def save_config(root: Path, config: dict[str, Any]) -> None:
     atomic_json(sdd_dir(root) / "config.yaml", config)
+
+
+def process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return windows_process_is_alive(pid)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError as exc:
+        # ESRCH is the only portable indication that the process is absent.
+        # EPERM and unexpected failures mean the process may still own a lock.
+        return exc.errno != errno.ESRCH
+
+
+def windows_process_is_alive(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    error_invalid_parameter = 87
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    open_process.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    handle = open_process(process_query_limited_information, False, pid)
+    if handle:
+        close_handle(handle)
+        return True
+
+    # ERROR_INVALID_PARAMETER is the documented result for a nonexistent PID.
+    # Access denial and unexpected query failures are treated conservatively:
+    # reclaiming a lock owned by a process we cannot inspect is unsafe.
+    return ctypes.get_last_error() != error_invalid_parameter
+
+
+@contextmanager
+def linux_execution_lock(root: Path):
+    import fcntl
+
+    path = sdd_dir(root) / "runtime" / "execution.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            try:
+                owner = load_json(path)
+                pid = int(owner.get("pid", -1))
+            except (SddError, TypeError, ValueError):
+                pid = -1
+            raise SddError(f"Another Runner owns the workspace lock: pid={pid}") from exc
+
+        os.ftruncate(descriptor, 0)
+        payload = json.dumps({"pid": os.getpid(), "created_at": now()}).encode("utf-8")
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+        os.fsync(descriptor)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+@contextmanager
+def pid_file_execution_lock(root: Path):
+    path = sdd_dir(root) / "runtime" / "execution.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump({"pid": os.getpid(), "created_at": now()}, stream)
+            break
+        except FileExistsError:
+            try:
+                owner = load_json(path)
+                pid = int(owner.get("pid", -1))
+            except (SddError, TypeError, ValueError):
+                pid = -1
+            if process_is_alive(pid):
+                raise SddError(f"Another Runner owns the workspace lock: pid={pid}")
+            path.unlink(missing_ok=True)
+    try:
+        yield
+    finally:
+        try:
+            owner = load_json(path)
+            if int(owner.get("pid", -1)) == os.getpid():
+                path.unlink(missing_ok=True)
+        except (SddError, TypeError, ValueError):
+            pass
+
+
+@contextmanager
+def execution_lock(root: Path):
+    lock = linux_execution_lock if sys.platform.startswith("linux") else pid_file_execution_lock
+    with lock(root):
+        yield
+
+
+def validate_execution_preflight(root: Path, state: dict[str, Any]) -> None:
+    changed = git_changed(root)
+    if state.get("status") == "running" and changed:
+        raise SddError(
+            "Running state must start from a clean verified checkpoint; unexpected changes:\n- "
+            + "\n- ".join(changed)
+        )
 
 
 def change_dir(root: Path, state: dict[str, Any]) -> Path:
@@ -1444,13 +1565,16 @@ def gate_and_advance(root: Path) -> None:
 
 def run_once(args: argparse.Namespace) -> None:
     root = project_root(args.project)
-    state = load_state(root)
-    if state["status"] == "closed":
-        print("Run is already closed")
-        return
-    execute_stage(root, state, args.dry_run)
-    if not args.dry_run:
-        gate_and_advance(root)
+    with execution_lock(root):
+        state = load_state(root)
+        if state["status"] == "closed":
+            print("Run is already closed")
+            return
+        if not args.dry_run:
+            validate_execution_preflight(root, state)
+        execute_stage(root, state, args.dry_run)
+        if not args.dry_run:
+            gate_and_advance(root)
 
 
 def gate(args: argparse.Namespace) -> None:
@@ -1459,41 +1583,43 @@ def gate(args: argparse.Namespace) -> None:
 
 def run_loop(args: argparse.Namespace) -> None:
     root = project_root(args.project)
-    steps = 0
-    while steps < args.max_steps:
-        state = load_state(root)
-        if state["status"] in {"closed", "blocked"}:
-            if state["status"] == "closed" and not (sdd_dir(root) / "delivery-report.md").exists():
-                emit_final_report(root, state)
-            print(json.dumps(state, indent=2, ensure_ascii=False))
-            return
-        try:
-            execute_stage(root, state, False)
-            gate_and_advance(root)
-        except SddError as exc:
+    with execution_lock(root):
+        steps = 0
+        while steps < args.max_steps:
             state = load_state(root)
-            key = state["stage"]
-            if state["status"] != "repair_required":
-                state["retries"][key] = state["retries"].get(key, 0) + 1
-            maximum = load_json(sdd_dir(root) / "policy" / "autonomy.yaml")["retry"]["per_stage"]
-            if state["retries"].get(key, 0) > maximum:
-                state["status"] = "blocked"
-                state["blocking_reason"] = str(exc)
-            else:
-                state["status"] = "running"
-            save_state(root, state)
-            if state["status"] == "blocked":
-                raise
-            append_journal(
-                root,
-                {"event": "repair_cycle_started", "stage": state["stage"], "reason": str(exc)},
-            )
-        steps += 1
-    state = load_state(root)
-    state["status"] = "blocked"
-    state["blocking_reason"] = f"maximum runner steps reached: {args.max_steps}"
-    save_state(root, state)
-    raise SddError(state["blocking_reason"])
+            if state["status"] in {"closed", "blocked"}:
+                if state["status"] == "closed" and not (sdd_dir(root) / "delivery-report.md").exists():
+                    emit_final_report(root, state)
+                print(json.dumps(state, indent=2, ensure_ascii=False))
+                return
+            try:
+                validate_execution_preflight(root, state)
+                execute_stage(root, state, False)
+                gate_and_advance(root)
+            except SddError as exc:
+                state = load_state(root)
+                key = state["stage"]
+                if state["status"] != "repair_required":
+                    state["retries"][key] = state["retries"].get(key, 0) + 1
+                maximum = load_json(sdd_dir(root) / "policy" / "autonomy.yaml")["retry"]["per_stage"]
+                if state["retries"].get(key, 0) > maximum:
+                    state["status"] = "blocked"
+                    state["blocking_reason"] = str(exc)
+                else:
+                    state["status"] = "repair_required" if git_changed(root) else "running"
+                save_state(root, state)
+                if state["status"] == "blocked":
+                    raise
+                append_journal(
+                    root,
+                    {"event": "repair_cycle_started", "stage": state["stage"], "reason": str(exc)},
+                )
+            steps += 1
+        state = load_state(root)
+        state["status"] = "blocked"
+        state["blocking_reason"] = f"maximum runner steps reached: {args.max_steps}"
+        save_state(root, state)
+        raise SddError(state["blocking_reason"])
 
 
 def emit_final_report(root: Path, state: dict[str, Any]) -> Path:
@@ -1535,6 +1661,9 @@ def recover(args: argparse.Namespace) -> None:
         errors.append("Current handoff is missing")
     if state.get("last_verified_commit") and git_head(root) != state["last_verified_commit"]:
         errors.append("Git HEAD differs from last verified commit")
+    changed = git_changed(root)
+    if state.get("status") == "running" and changed:
+        errors.append("Running state has unexpected uncommitted changes: " + ", ".join(changed))
     result = {
         "status": "FAIL" if errors else "PASS",
         "run_id": state["run_id"],

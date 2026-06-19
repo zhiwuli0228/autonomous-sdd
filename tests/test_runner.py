@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import errno
+import os
 import shutil
 import subprocess
 import sys
@@ -9,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -313,6 +316,83 @@ class RunnerSmokeTest(unittest.TestCase):
         )
         self.assertEqual([], commands)
         self.assertTrue(any("changed no test file" in error for error in errors))
+
+    def test_recovery_rejects_dirty_running_checkpoint(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "dirty-checkpoint",
+            "Reject unknown workspace changes before autonomous execution",
+        )
+        unknown = self.project / "src" / "unknown-change.txt"
+        unknown.parent.mkdir(parents=True, exist_ok=True)
+        unknown.write_text("unexpected\n", encoding="utf-8")
+        result = run("--project", str(self.project), "recover", expected=2)
+        self.assertIn("unexpected uncommitted changes", result.stdout)
+
+    def test_live_pid_file_lock_rejects_second_runner(self) -> None:
+        lock = self.project / ".sdd" / "runtime" / "execution.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(json.dumps({"pid": os.getpid(), "created_at": "test"}), encoding="utf-8")
+        with self.assertRaises(SDD.SddError):
+            with SDD.pid_file_execution_lock(self.project):
+                pass
+
+    def test_windows_process_check_does_not_call_os_kill(self) -> None:
+        with (
+            mock.patch.object(SDD.os, "name", "nt"),
+            mock.patch.object(SDD, "windows_process_is_alive", return_value=True) as win32_query,
+            mock.patch.object(SDD.os, "kill") as os_kill,
+        ):
+            self.assertTrue(SDD.process_is_alive(1234))
+        win32_query.assert_called_once_with(1234)
+        os_kill.assert_not_called()
+
+    def test_posix_process_check_only_treats_esrch_as_absent(self) -> None:
+        with (
+            mock.patch.object(SDD.os, "name", "posix"),
+            mock.patch.object(SDD.os, "kill", side_effect=ProcessLookupError(errno.ESRCH, "missing")),
+        ):
+            self.assertFalse(SDD.process_is_alive(1234))
+        with (
+            mock.patch.object(SDD.os, "name", "posix"),
+            mock.patch.object(SDD.os, "kill", side_effect=PermissionError(errno.EPERM, "denied")),
+        ):
+            self.assertTrue(SDD.process_is_alive(1234))
+        with (
+            mock.patch.object(SDD.os, "name", "posix"),
+            mock.patch.object(SDD.os, "kill", side_effect=OSError(errno.EIO, "unknown")),
+        ):
+            self.assertTrue(SDD.process_is_alive(1234))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux flock behavior")
+    def test_linux_execution_lock_rejects_second_runner(self) -> None:
+        with SDD.linux_execution_lock(self.project):
+            with self.assertRaises(SDD.SddError):
+                with SDD.linux_execution_lock(self.project):
+                    pass
+
+    def test_linux_platform_dispatches_to_flock(self) -> None:
+        lock_context = mock.MagicMock()
+        with (
+            mock.patch.object(SDD.sys, "platform", "linux"),
+            mock.patch.object(SDD, "linux_execution_lock", return_value=lock_context) as linux_lock,
+        ):
+            with SDD.execution_lock(self.project):
+                pass
+        linux_lock.assert_called_once_with(self.project)
+        lock_context.__enter__.assert_called_once_with()
+        lock_context.__exit__.assert_called_once()
+
+    def test_stale_pid_file_lock_is_reclaimed(self) -> None:
+        lock = self.project / ".sdd" / "runtime" / "execution.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(json.dumps({"pid": 99999999, "created_at": "test"}), encoding="utf-8")
+        with SDD.pid_file_execution_lock(self.project):
+            self.assertTrue(lock.exists())
+        self.assertFalse(lock.exists())
 
 
 if __name__ == "__main__":
