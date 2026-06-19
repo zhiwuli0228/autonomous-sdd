@@ -1,45 +1,41 @@
 # Autonomous SDD
 
-Autonomous SDD is a one-command, unattended software-delivery orchestrator for
-coding competitions and constrained internal development environments.
+Autonomous SDD 是一个面向编程竞赛和受限内部开发环境的“一键式、无人值守”软件交付编排器。
 
-It combines:
+它将以下能力组合为一条完整交付流水线：
 
-- OpenSpec for requirements and capability specifications;
-- a bundled Superspec workflow for artifact ordering and gates;
-- OpenCode as the coding-agent runtime;
-- persistent handoffs, Git checkpoints, policy guards, verification, archive,
-  and recovery controlled by a deterministic Python runner.
+- 使用 OpenSpec 管理需求和能力规格；
+- 使用内置 Superspec 工作流约束工件顺序与阶段门禁；
+- 使用 OpenCode 作为编码 Agent 的运行环境；
+- 使用确定性的 Python Runner 管理状态、阶段交接、Git 检查点、规则校验、恢复与归档。
 
-The user provides a project and a task file. Autonomous SDD drives the change
-from discovery through implementation, independent review, verification,
-OpenSpec archive, retrospective, and final delivery reporting.
+使用者只需要提供目标项目和任务文件。Autonomous SDD 会自动完成需求分析、规格设计、任务分解、代码实现、独立审查、验证、OpenSpec 归档、复盘和最终交付报告。
 
-## Key properties
+## 核心特性
 
-- One external command
-- No human interaction after execution starts
-- One working tree and one writer
-- Fresh OpenCode session for every stage or implementation task
-- OpenCode's environment-default model unless explicitly configured
-- Persistent state independent of conversation context
-- Stage handoff and Git checkpoint after every passing gate
-- Protected API, dependency, policy, schema, and scope checks
-- Bounded retries with a safe `BLOCKED` result
-- Automatic OpenSpec main-spec synchronization and archive
-- Windows and Unix entry points
+- 对外只有一个执行命令
+- 启动后不需要人工参与
+- 单工作区、单写入者，不使用 Git worktree
+- 每个阶段或实现任务使用独立的 OpenCode 会话
+- 默认使用 OpenCode 环境中已经配置的模型
+- 运行状态持久化，不依赖聊天上下文保存记忆
+- 每个阶段通过后生成交接记录和 Git 检查点
+- 自动保护公共 API、依赖文件、策略文件、Schema 和修改范围
+- 重试次数受限，无法继续时安全进入 `BLOCKED`
+- 自动同步 OpenSpec 主规格并归档 Change
+- 同时提供 Windows 和 Unix 入口
 
-## Requirements
+## 环境要求
 
-The execution machine must provide:
+执行机器需要提前安装：
 
-- Python 3.10 or later
+- Python 3.10 或更高版本
 - Git
 - OpenCode
 - OpenSpec CLI
-- The target project's build and test tools
+- 目标项目自身需要的构建和测试工具
 
-Check locally:
+可以使用以下命令检查本地环境：
 
 ```powershell
 python --version
@@ -48,106 +44,104 @@ opencode --version
 openspec.cmd --version
 ```
 
-OpenCode must already be configured to access an available model. Autonomous
-SDD does not select a model by default.
+OpenCode 需要提前配置好可用模型。Autonomous SDD 默认不会自行指定或切换模型。
 
-## Quick start
+## 快速开始
 
-Create a UTF-8 task file, for example `competition-task.md`:
+首先准备一个 UTF-8 编码的任务文件，例如 `competition-task.md`：
 
 ```markdown
-Implement the requested scheduling behavior.
+实现指定的任务调度行为。
 
-Constraints:
+约束：
 
-- Do not change public APIs.
-- Do not add dependencies.
-- Preserve existing architecture boundaries.
-- Add automated tests for normal and boundary behavior.
+- 不允许修改公共 API；
+- 不允许新增依赖；
+- 保持现有架构边界；
+- 为正常场景和边界场景补充自动化测试。
 ```
 
-Run the competition workflow:
+然后执行：
 
 ```powershell
 sdd-competition.cmd E:\path\to\project E:\path\to\competition-task.md
 ```
 
-That is the only required competition command.
+这就是正式比赛执行所需的唯一命令。
 
-The target repository must be clean before execution starts.
+目标 Git 仓库在执行前必须处于干净状态。
 
-## Rehearsal mode
+## 本地演练模式
 
-Before using a real model, validate the complete control system with the
-deterministic rehearsal executor:
+在调用真实模型之前，可以先使用确定性演练执行器验证整个控制系统：
 
 ```powershell
 sdd-competition.cmd E:\path\to\project E:\path\to\competition-task.md --rehearse
 ```
 
-Rehearsal mode performs the full lifecycle without calling a model:
+演练模式不会调用模型，但会实际完成全部生命周期：
 
 ```text
-project detection
-→ harness installation
-→ baseline capture
-→ brainstorm
-→ proposal
-→ specifications
-→ design
-→ tasks and plan
-→ implementation task loop
-→ independent review
-→ verification
-→ finalize
-→ archive and main-spec sync
-→ retrospective
-→ CLOSED report
+项目探测
+→ 自动安装交付框架
+→ 冻结项目基线
+→ 需求探索
+→ Change Proposal
+→ 能力规格
+→ 技术设计
+→ 任务和执行计划
+→ 实现任务循环
+→ 独立代码审查
+→ 完整验证
+→ Finalize
+→ 归档和主规格同步
+→ 复盘
+→ CLOSED 交付报告
 ```
 
-Use a disposable clone or test repository for rehearsal because the workflow
-creates commits and delivery artifacts.
+演练过程会创建 Git 提交和交付工件，因此建议在项目的临时克隆或测试仓库中执行。
 
-## Unix entry
+## Unix 入口
+
+正式执行：
 
 ```sh
 ./sdd-competition /path/to/project /path/to/competition-task.md
 ```
 
-Rehearsal:
+演练模式：
 
 ```sh
 ./sdd-competition /path/to/project /path/to/competition-task.md --rehearse
 ```
 
-## What the one-command entry does
+## 一键命令会自动完成什么
 
-The runner automatically:
+Runner 会自动执行以下操作：
 
-1. Requires a clean Git repository.
-2. Detects Maven, Gradle, npm/pnpm, Python, Go, Rust, or a generic project.
-3. Installs the OpenCode skill, OpenSpec schema, templates, policies, and
-   runtime entry points without overwriting existing top-level instructions.
-4. Configures the detected project test command.
-5. Commits the installed competition harness.
-6. Freezes policy, schema, dependency, and protected API baselines.
-7. Creates a bounded OpenSpec change.
-8. Runs each lifecycle stage in a fresh OpenCode session.
-9. Executes deterministic gates before every transition.
-10. Commits each verified stage.
-11. Synchronizes implemented capability specs and archives the change.
-12. Produces a retrospective and final delivery report.
+1. 检查目标 Git 仓库是否干净；
+2. 识别 Maven、Gradle、npm、pnpm、Python、Go、Rust 或通用项目；
+3. 安装 OpenCode Skill、OpenSpec Schema、模板、策略和运行入口；
+4. 自动配置目标项目的测试命令；
+5. 提交比赛交付框架；
+6. 冻结策略、Schema、依赖文件和受保护 API 基线；
+7. 创建受控的 OpenSpec Change；
+8. 为每个生命周期阶段启动新的 OpenCode 会话；
+9. 在每次状态推进前运行确定性门禁；
+10. 为每个通过验证的阶段生成 Git 提交；
+11. 同步已经实现的能力规格并归档 Change；
+12. 生成复盘和最终交付报告。
 
-## Outputs
+## 执行结果
 
-Successful execution prints:
+成功完成时输出：
 
 ```text
 RESULT=CLOSED
 REPORT=<project>\.sdd\delivery-report.md
 ```
 
-Important artifacts include:
+主要交付工件包括：
 
 ```text
 .sdd/delivery-report.md
@@ -157,35 +151,33 @@ openspec/specs/
 openspec/changes/archive/
 ```
 
-Volatile runtime state is stored under `.sdd/runtime/` and excluded from Git.
+运行时状态保存在 `.sdd/runtime/`，默认不会提交到 Git。
 
-If the workflow cannot complete safely, it exits non-zero and records:
+如果系统无法在安全边界内继续执行，会返回非零退出码，并记录：
 
 ```text
 status: blocked
-blocking_reason: <specific reason>
-last_verified_commit: <safe checkpoint>
+blocking_reason: <具体原因>
+last_verified_commit: <最后一个安全检查点>
 ```
 
-## Default safety policy
+## 默认安全策略
 
-The bundled policy denies:
+内置策略默认禁止：
 
-- human interaction after execution starts;
-- worktrees and parallel writers;
-- dependency manifest changes;
-- policy, baseline, runner, and Superspec schema changes;
-- grader, evaluation, and official fixture changes;
-- common `api` and `contract` package changes;
-- scope expansion beyond detected source and test paths.
+- 启动后的人工干预；
+- Git worktree 和多个并行写入者；
+- 修改依赖清单；
+- 修改策略、基线、Runner 和 Superspec Schema；
+- 修改评分器、评测代码和官方测试数据；
+- 修改常见的 `api` 和 `contract` 包；
+- 超出自动识别的源码和测试目录进行修改。
 
-Project-specific rules may be placed in `.sdd/policy/` before a manually
-managed run. For the one-command competition path, conservative defaults are
-applied automatically.
+项目特有规则可以定义在 `.sdd/policy/` 下。正式一键执行默认采用保守策略。
 
-## Model behavior
+## 模型选择
 
-`.sdd/config.yaml` uses:
+`.sdd/config.yaml` 默认配置为：
 
 ```json
 {
@@ -193,10 +185,9 @@ applied automatically.
 }
 ```
 
-When `model` is `null`, the runner does not pass `--model`; OpenCode uses the
-model configured by the execution environment.
+当 `model` 为 `null` 时，Runner 不会传递 `--model` 参数，OpenCode 会使用当前执行环境已经配置的默认模型。
 
-Set an explicit model only when its provider/model identifier is guaranteed:
+只有在能够保证模型标识稳定时，才建议配置显式模型：
 
 ```json
 {
@@ -204,10 +195,46 @@ Set an explicit model only when its provider/model identifier is guaranteed:
 }
 ```
 
-## Lower-level commands
+## 上下文与恢复机制
 
-The one-command entry is recommended. Lower-level commands exist for
-development and diagnostics:
+Autonomous SDD 不将聊天历史视为可靠状态源。
+
+系统通过以下文件维持执行记忆：
+
+```text
+.sdd/runtime/state.json
+.sdd/runtime/current-handoff.json
+.sdd/runtime/task-packet.json
+.sdd/runtime/execution-journal.jsonl
+```
+
+每次 Agent 调用只接收当前阶段所需的任务包、约束和相关工件。即使 OpenCode 压缩上下文或重新启动会话，Runner 也可以根据持久化状态继续执行。
+
+## OpenSpec 和 Superspec
+
+项目内置 `autonomous-superspec` Schema，生命周期为：
+
+```text
+brainstorm
+→ proposal
+→ specs
+→ design
+→ tasks
+→ plan
+→ apply
+→ review
+→ verify
+→ finalize
+→ archive
+→ retrospective
+→ closed
+```
+
+OpenSpec 负责描述需要交付的行为，Superspec 负责约束工件依赖，Runner 负责实际状态推进和机器门禁。
+
+## 底层命令
+
+正常比赛应优先使用一键入口。以下命令主要用于开发、调试和故障排查：
 
 ```powershell
 python scripts\sdd.py init E:\path\to\project
@@ -219,28 +246,28 @@ python scripts\sdd.py init E:\path\to\project
 .\sdd.cmd recover
 ```
 
-These commands are not required for normal competition execution.
+普通比赛执行不需要手工调用这些命令。
 
-## Local validation
+## 本地验证
 
-Validate the runner and skill:
+验证 Runner 和 Skill：
 
 ```powershell
 python -m unittest discover -s tests -v
 python -m py_compile scripts\sdd.py tests\test_runner.py
-python C:\path\to\skill-creator\scripts\quick_validate.py .
 ```
 
-The automated suite covers:
+自动化测试覆盖：
 
-- installation into a plain Git repository;
-- complete one-command lifecycle closure;
-- policy tampering detection;
-- protected API modification detection;
-- retry exhaustion and safe blocking;
-- OpenSpec archive and main-spec synchronization.
+- 从普通 Git 仓库自动安装并开始执行；
+- 一键完成完整生命周期；
+- 策略文件篡改检测；
+- 受保护 API 修改检测；
+- 重试次数耗尽后的安全阻塞；
+- OpenSpec 归档和主规格同步。
 
-## Current status
+## 当前状态
 
-Version `0.2.0` has passed deterministic full-lifecycle validation. Real-model
-rehearsal with the target OpenCode environment is the next validation layer.
+当前版本为 `0.2.0`。
+
+该版本已经通过确定性的完整生命周期测试。下一阶段验证重点是目标 OpenCode 环境中的真实模型执行效果、失败恢复质量和复杂项目适配能力。
