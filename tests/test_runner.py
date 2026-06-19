@@ -262,6 +262,58 @@ class RunnerSmokeTest(unittest.TestCase):
         self.assertIn("  - implement first", migrated)
         self.assertNotIn("- [ ] implement first", migrated)
 
+    def test_strict_result_contract_rejects_summary_style_test_object(self) -> None:
+        state = {"stage": "apply"}
+        result = {
+            "status": "completed",
+            "summary": "implemented",
+            "files_read": [],
+            "files_changed": [],
+            "commands_run": ["mvn test"],
+            "tests": {"passed": 16},
+            "deviations": [],
+            "blocking_reason": None,
+            "task_id": "1.1",
+            "requirement_evidence": [],
+            "residual_risks": [],
+        }
+        errors = SDD.validate_agent_result(self.project, state, result)
+        self.assertTrue(any("commands_run" in error for error in errors))
+        self.assertTrue(any("tests" in error for error in errors))
+        self.assertTrue(any("requirement evidence" in error for error in errors))
+
+    def test_maven_focused_test_is_derived_from_changed_test_files(self) -> None:
+        project_policy = self.project / ".sdd" / "policy" / "project.yaml"
+        policy = json.loads(project_policy.read_text(encoding="utf-8"))
+        policy["detected_project_kind"] = "java-maven"
+        project_policy.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
+        (self.project / "mvnw.cmd").write_text("@echo off\r\n", encoding="utf-8")
+        commands, errors = SDD.focused_test_commands(
+            self.project,
+            [
+                "src/main/java/sample/Feature.java",
+                "src/test/java/sample/FeatureTest.java",
+                "src/test/java/sample/FeatureEdgeTest.java",
+            ],
+        )
+        self.assertEqual([], errors)
+        self.assertEqual(
+            [[".\\mvnw.cmd", "-Dtest=FeatureEdgeTest,FeatureTest", "test"]],
+            commands,
+        )
+
+    def test_apply_requires_changed_test_file_for_independent_proof(self) -> None:
+        project_policy = self.project / ".sdd" / "policy" / "project.yaml"
+        policy = json.loads(project_policy.read_text(encoding="utf-8"))
+        policy["detected_project_kind"] = "java-maven"
+        project_policy.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
+        commands, errors = SDD.focused_test_commands(
+            self.project,
+            ["src/main/java/sample/Feature.java"],
+        )
+        self.assertEqual([], commands)
+        self.assertTrue(any("changed no test file" in error for error in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

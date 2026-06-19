@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 MIN_APPLY_TASKS = 3
 MAX_APPLY_TASKS = 20
 STAGES = [
@@ -222,7 +222,16 @@ def git_changed(root: Path) -> list[str]:
             path = line[3:].strip().replace("\\", "/")
             if " -> " in path:
                 path = path.split(" -> ", 1)[1]
-            changed.append(path.strip('"'))
+            path = path.strip('"')
+            target = root / path
+            if path.endswith("/") and target.is_dir():
+                changed.extend(
+                    rel(root, child)
+                    for child in target.rglob("*")
+                    if child.is_file() and ".git" not in child.parts
+                )
+            else:
+                changed.append(path)
     return sorted(set(changed))
 
 
@@ -440,6 +449,121 @@ def configure_detected_project(root: Path, detected: dict[str, Any]) -> None:
     project["detected_project_kind"] = detected["kind"]
     project["change_boundaries"]["allowed"] = detected["sources"]
     atomic_json(project_path, project)
+
+
+def validate_string_list(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return [f"Agent result {field} must be an array of strings"]
+    return []
+
+
+def validate_agent_result(root: Path, state: dict[str, Any], result: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    required = {
+        "status",
+        "summary",
+        "files_read",
+        "files_changed",
+        "commands_run",
+        "tests",
+        "deviations",
+        "blocking_reason",
+        "task_id",
+        "requirement_evidence",
+        "residual_risks",
+    }
+    extra = sorted(set(result) - required)
+    missing = sorted(required - set(result))
+    if missing:
+        errors.append("Agent result missing fields: " + ", ".join(missing))
+    if extra:
+        errors.append("Agent result has unsupported fields: " + ", ".join(extra))
+    if result.get("status") not in {"completed", "failed", "blocked"}:
+        errors.append("Agent result status is invalid")
+    if not isinstance(result.get("summary"), str) or not result.get("summary", "").strip():
+        errors.append("Agent result summary must be a non-empty string")
+    for field in ["files_read", "files_changed", "deviations", "residual_risks"]:
+        errors.extend(validate_string_list(result.get(field), field))
+    commands = result.get("commands_run")
+    if not isinstance(commands, list) or not all(
+        isinstance(command, list) and command and all(isinstance(part, str) for part in command)
+        for command in commands
+    ):
+        errors.append("Agent result commands_run must be an array of non-empty string arrays")
+    tests = result.get("tests")
+    if not isinstance(tests, list) or not all(
+        isinstance(test, dict)
+        and set(test) == {"command", "exit_code"}
+        and isinstance(test["command"], list)
+        and test["command"]
+        and all(isinstance(part, str) for part in test["command"])
+        and isinstance(test["exit_code"], int)
+        for test in tests
+    ):
+        errors.append("Agent result tests must contain only {command: string[], exit_code: integer} objects")
+    evidence = result.get("requirement_evidence")
+    if not isinstance(evidence, list) or not all(
+        isinstance(item, dict)
+        and set(item) == {"requirement", "implementation_files", "test_files", "status"}
+        and isinstance(item["requirement"], str)
+        and item["requirement"].strip()
+        and isinstance(item["implementation_files"], list)
+        and all(isinstance(path, str) for path in item["implementation_files"])
+        and isinstance(item["test_files"], list)
+        and all(isinstance(path, str) for path in item["test_files"])
+        and item["status"] in {"satisfied", "partial", "not_satisfied"}
+        for item in evidence
+    ):
+        errors.append("Agent result requirement_evidence has an invalid structure")
+    elif state["stage"] == "apply":
+        if not evidence:
+            errors.append("Apply result must include requirement evidence")
+        for item in evidence:
+            if item["status"] != "satisfied":
+                errors.append(f"Requirement is not satisfied: {item['requirement']}")
+            if not item["implementation_files"]:
+                errors.append(f"Requirement has no implementation evidence: {item['requirement']}")
+            if not item["test_files"]:
+                errors.append(f"Requirement has no test evidence: {item['requirement']}")
+            for path in item["implementation_files"] + item["test_files"]:
+                if not (root / path).is_file():
+                    errors.append(f"Requirement evidence file does not exist: {path}")
+    return errors
+
+
+def focused_test_commands(root: Path, changed: list[str]) -> tuple[list[list[str]], list[str]]:
+    project = load_json(sdd_dir(root) / "policy" / "project.yaml")
+    kind = project.get("detected_project_kind", "generic")
+    test_files = sorted(
+        path
+        for path in changed
+        if path.startswith(("src/test/", "test/", "tests/"))
+        or path.endswith(("_test.go", ".spec.js", ".test.js", ".spec.ts", ".test.ts"))
+    )
+    if not test_files:
+        return [], ["Apply task changed no test file; Runner cannot prove the new behavior"]
+    if kind == "java-maven":
+        names = sorted({Path(path).stem for path in test_files if path.endswith(".java")})
+        if not names:
+            return [], ["No Maven test class could be derived from changed tests"]
+        executable = ".\\mvnw.cmd" if (root / "mvnw.cmd").exists() else (
+            "./mvnw" if (root / "mvnw").exists() else "mvn"
+        )
+        return [[executable, f"-Dtest={','.join(names)}", "test"]], []
+    if kind == "java-gradle":
+        executable = ".\\gradlew.bat" if (root / "gradlew.bat").exists() else "./gradlew"
+        command = [executable, "test"]
+        for path in test_files:
+            if path.endswith(".java"):
+                class_name = path.removeprefix("src/test/java/").removesuffix(".java").replace("/", ".")
+                command.extend(["--tests", class_name])
+        return ([command], []) if len(command) > 2 else ([], ["No Gradle test class could be derived"])
+    if kind == "python":
+        return [[sys.executable, "-m", "pytest", *test_files]], []
+    if kind == "go":
+        packages = sorted({"./" + str(Path(path).parent).replace("\\", "/") for path in test_files})
+        return [["go", "test", *packages]], []
+    return [], [f"Focused test derivation is unsupported for project kind: {kind}"]
 
 
 def ensure_git_identity(root: Path) -> None:
@@ -765,6 +889,15 @@ def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
             "result_statuses": ["completed", "failed", "blocked"],
             "required_sections": REQUIRED_SECTIONS.get(stage, []),
             "tests": load_json(sdd_dir(root) / "policy" / "verification.yaml")["commands"],
+            "result_contract": {
+                "commands_run": "array of argv arrays; never shell strings",
+                "tests": "array of {command: argv array, exit_code: integer}",
+                "requirement_evidence": (
+                    "array of {requirement, implementation_files, test_files, status}; "
+                    "status must be satisfied for completion"
+                ),
+                "residual_risks": "array of concrete unverified or deferred risks",
+            },
         },
     }
     packet_path = sdd_dir(root) / "runtime" / "task-packet.json"
@@ -781,7 +914,8 @@ def prompt_for(packet: dict[str, Any]) -> str:
         "Do not commit or change lifecycle state. Do not modify policy, baseline, runner, schema, "
         "dependency manifests, protected API, or forbidden paths. "
         "Write .sdd/runtime/agent-result.json using status, summary, files_read, files_changed, "
-        "commands_run, tests, deviations, blocking_reason, and task_id. "
+        "commands_run, tests, deviations, blocking_reason, task_id, requirement_evidence, and residual_risks. "
+        "Follow acceptance.result_contract exactly; commands must be argv arrays, not shell strings. "
         "For apply, task_id must exactly match the packet and you must not edit task checkboxes; "
         "the Runner owns task completion state. "
         "Do not ask questions; if essential intent is ambiguous, return status blocked with the exact reason. "
@@ -802,6 +936,15 @@ def write_agent_result(root: Path, summary: str, changed: list[str], task_id: st
             "deviations": [],
             "blocking_reason": None,
             "task_id": task_id,
+            "requirement_evidence": [
+                {
+                    "requirement": "Deterministic fixture behavior",
+                    "implementation_files": changed,
+                    "test_files": changed,
+                    "status": "satisfied",
+                }
+            ] if task_id else [],
+            "residual_risks": [],
         },
     )
 
@@ -1131,24 +1274,13 @@ def execute_gates(root: Path, state: dict[str, Any]) -> tuple[list[str], list[di
     errors.extend(validate_scope(root, stage))
     errors.extend(validate_stage_artifact(root, state))
     result_path = sdd_dir(root) / "runtime" / "agent-result.json"
+    agent_result: dict[str, Any] = {}
     if not result_path.exists():
         errors.append("Agent result is missing")
     else:
         try:
             agent_result = load_json(result_path)
-            required = {
-                "status",
-                "summary",
-                "files_read",
-                "files_changed",
-                "commands_run",
-                "tests",
-                "deviations",
-                "blocking_reason",
-            }
-            missing = sorted(required - set(agent_result))
-            if missing:
-                errors.append("Agent result missing fields: " + ", ".join(missing))
+            errors.extend(validate_agent_result(root, state, agent_result))
             if agent_result.get("status") != "completed":
                 errors.append(f"Agent result status is not completed: {agent_result.get('status')}")
             if stage == "apply":
@@ -1162,21 +1294,34 @@ def execute_gates(root: Path, state: dict[str, Any]) -> tuple[list[str], list[di
         except SddError as exc:
             errors.append(str(exc))
     if stage == "apply":
+        changed = git_changed(root)
         substantive = [
             path
-            for path in git_changed(root)
+            for path in changed
             if not path.startswith(("openspec/", ".sdd/"))
         ]
         if not substantive:
             errors.append("Apply task made no substantive source or test change")
+        declared = sorted(agent_result.get("files_changed", [])) if isinstance(agent_result.get("files_changed"), list) else []
+        if declared and declared != sorted(substantive):
+            errors.append(
+                "Agent result files_changed does not match actual substantive changes: "
+                f"declared={declared}, actual={sorted(substantive)}"
+            )
     evidence: list[dict[str, Any]] = []
     should_test = stage in {"apply", "review", "verify", "finalize", "archive"}
     if should_test:
         commands = verification_commands(root, stage)
+        if stage == "apply" and load_config(root).get("executor") != "fixture":
+            focused, focused_errors = focused_test_commands(root, git_changed(root))
+            commands.extend(focused)
+            errors.extend(focused_errors)
         for index, command in enumerate(commands):
             if command and command[0] == "openspec.cmd" and os.name != "nt":
                 command = ["openspec", *command[1:]]
-            result = run_command(command, root, timeout=load_config(root)["timeouts"]["verification_seconds"])
+            timeout_key = "focused_test_seconds" if stage == "apply" and index >= len(verification_commands(root, stage)) else "verification_seconds"
+            timeout = load_config(root)["timeouts"].get(timeout_key, load_config(root)["timeouts"]["verification_seconds"])
+            result = run_command(command, root, timeout=timeout)
             evidence_path = write_evidence(root, f"{stage}-{state['iteration']}-gate-{index}", command, result)
             evidence.append({"command": command, "exit_code": result.returncode, "path": evidence_path})
             if result.returncode != 0:
@@ -1195,6 +1340,8 @@ def write_handoff(
     handoff_dir.mkdir(parents=True, exist_ok=True)
     number = len(list(handoff_dir.glob("*.json"))) + 1
     artifacts: dict[str, str] = {}
+    agent_result_path = sdd_dir(root) / "runtime" / "agent-result.json"
+    agent_result = load_json(agent_result_path) if agent_result_path.exists() else {}
     directory = change_dir(root, state)
     if directory.exists():
         for path in directory.rglob("*"):
@@ -1211,8 +1358,10 @@ def write_handoff(
         "repository": {"commit_before_checkpoint": git_head(root), "changed_files": git_changed(root)},
         "artifacts": artifacts,
         "evidence": evidence,
+        "requirement_evidence": agent_result.get("requirement_evidence", []),
         "blocking_findings": [],
-        "residual_risks": [],
+        "residual_risks": list(agent_result.get("residual_risks", []))
+        + ([] if completed_stage == "verify" else ["Full project verification has not run yet"]),
         "next_action": "execute_stage" if next_stage != "closed" else "emit_final_report",
         "created_at": now(),
     }

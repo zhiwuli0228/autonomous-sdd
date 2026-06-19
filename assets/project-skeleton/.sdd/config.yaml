@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "distribution_version": "0.2.2",
+  "distribution_version": "0.3.0",
   "model": null,
   "executor": "opencode",
   "git": {
@@ -8,6 +8,7 @@
   },
   "timeouts": {
     "agent_seconds": 1200,
+    "focused_test_seconds": 300,
     "verification_seconds": 3600
   }
 }

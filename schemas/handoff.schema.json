@@ -12,6 +12,7 @@
     "repository",
     "artifacts",
     "evidence",
+    "requirement_evidence",
     "blocking_findings",
     "next_action"
   ],
@@ -28,6 +29,7 @@
     },
     "artifacts": {"type": "object"},
     "evidence": {"type": "array"},
+    "requirement_evidence": {"type": "array"},
     "blocking_findings": {"type": "array"},
     "residual_risks": {"type": "array"},
     "next_action": {"type": "string"}

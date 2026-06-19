@@ -13,6 +13,12 @@
   "forbidden_actions": [],
   "acceptance": {
     "write_result": ".sdd/runtime/agent-result.json",
-    "tests": {}
+    "tests": {},
+    "result_contract": {
+      "commands_run": "array of argv arrays",
+      "tests": "array of {command, exit_code}",
+      "requirement_evidence": "array of requirement-to-implementation-and-test mappings",
+      "residual_risks": "array of concrete remaining risks"
+    }
   }
 }
