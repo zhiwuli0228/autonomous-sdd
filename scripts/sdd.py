@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 STAGES = [
     "brainstorm",
     "proposal",
@@ -325,31 +325,82 @@ def compete(args: argparse.Namespace) -> None:
 
 def detect_project(root: Path) -> dict[str, Any]:
     if (root / "mvnw.cmd").exists():
-        return {"kind": "java-maven", "test": [".\\mvnw.cmd", "test"], "sources": ["src/**"]}
+        return {
+            "kind": "java-maven",
+            "quick_check": [".\\mvnw.cmd", "-DskipTests", "test-compile"],
+            "full_test": [".\\mvnw.cmd", "test"],
+            "sources": ["src/**"],
+        }
     if (root / "mvnw").exists():
-        return {"kind": "java-maven", "test": ["./mvnw", "test"], "sources": ["src/**"]}
+        return {
+            "kind": "java-maven",
+            "quick_check": ["./mvnw", "-DskipTests", "test-compile"],
+            "full_test": ["./mvnw", "test"],
+            "sources": ["src/**"],
+        }
     if (root / "pom.xml").exists():
-        return {"kind": "java-maven", "test": ["mvn", "test"], "sources": ["src/**"]}
+        return {
+            "kind": "java-maven",
+            "quick_check": ["mvn", "-DskipTests", "test-compile"],
+            "full_test": ["mvn", "test"],
+            "sources": ["src/**"],
+        }
     if (root / "gradlew.bat").exists():
-        return {"kind": "java-gradle", "test": [".\\gradlew.bat", "test"], "sources": ["src/**"]}
+        return {
+            "kind": "java-gradle",
+            "quick_check": [".\\gradlew.bat", "testClasses"],
+            "full_test": [".\\gradlew.bat", "test"],
+            "sources": ["src/**"],
+        }
     if (root / "gradlew").exists():
-        return {"kind": "java-gradle", "test": ["./gradlew", "test"], "sources": ["src/**"]}
+        return {
+            "kind": "java-gradle",
+            "quick_check": ["./gradlew", "testClasses"],
+            "full_test": ["./gradlew", "test"],
+            "sources": ["src/**"],
+        }
     if (root / "package.json").exists():
         manager = "pnpm" if (root / "pnpm-lock.yaml").exists() else "npm"
-        return {"kind": "javascript", "test": [manager, "test"], "sources": ["src/**", "test/**", "tests/**"]}
+        return {
+            "kind": "javascript",
+            "quick_check": [],
+            "full_test": [manager, "test"],
+            "sources": ["src/**", "test/**", "tests/**"],
+        }
     if (root / "pyproject.toml").exists() or (root / "pytest.ini").exists():
-        return {"kind": "python", "test": [sys.executable, "-m", "pytest"], "sources": ["src/**", "test/**", "tests/**"]}
+        return {
+            "kind": "python",
+            "quick_check": [sys.executable, "-m", "compileall", "-q", "src"],
+            "full_test": [sys.executable, "-m", "pytest"],
+            "sources": ["src/**", "test/**", "tests/**"],
+        }
     if (root / "go.mod").exists():
-        return {"kind": "go", "test": ["go", "test", "./..."], "sources": ["**/*.go"]}
+        return {
+            "kind": "go",
+            "quick_check": ["go", "test", "-run", "^$", "./..."],
+            "full_test": ["go", "test", "./..."],
+            "sources": ["**/*.go"],
+        }
     if (root / "Cargo.toml").exists():
-        return {"kind": "rust", "test": ["cargo", "test"], "sources": ["src/**", "tests/**"]}
-    return {"kind": "generic", "test": [], "sources": ["src/**", "test/**", "tests/**"]}
+        return {
+            "kind": "rust",
+            "quick_check": ["cargo", "check", "--tests"],
+            "full_test": ["cargo", "test"],
+            "sources": ["src/**", "tests/**"],
+        }
+    return {
+        "kind": "generic",
+        "quick_check": [],
+        "full_test": [],
+        "sources": ["src/**", "test/**", "tests/**"],
+    }
 
 
 def configure_detected_project(root: Path, detected: dict[str, Any]) -> None:
     verification_path = sdd_dir(root) / "policy" / "verification.yaml"
     verification = load_json(verification_path)
-    verification["commands"]["project_test"] = detected["test"]
+    verification["commands"]["project_quick_check"] = detected["quick_check"]
+    verification["commands"]["project_full_test"] = detected["full_test"]
     atomic_json(verification_path, verification)
     project_path = sdd_dir(root) / "policy" / "project.yaml"
     project = load_json(project_path)
@@ -943,9 +994,16 @@ def validate_scope(root: Path, stage: str) -> list[str]:
     return errors
 
 
-def verification_commands(root: Path, full: bool) -> list[list[str]]:
+def verification_commands(root: Path, stage: str) -> list[list[str]]:
     policy = load_json(sdd_dir(root) / "policy" / "verification.yaml")
-    names = policy["full_gate"] if full else policy["task_gate"]
+    gate_name = {
+        "apply": "task_gate",
+        "review": "review_gate",
+        "verify": "verify_gate",
+        "finalize": "closeout_gate",
+        "archive": "closeout_gate",
+    }.get(stage)
+    names = policy.get(gate_name, []) if gate_name else []
     commands: list[list[str]] = []
     for name in names:
         value = policy["commands"].get(name)
@@ -983,9 +1041,9 @@ def execute_gates(root: Path, state: dict[str, Any]) -> tuple[list[str], list[di
         except SddError as exc:
             errors.append(str(exc))
     evidence: list[dict[str, Any]] = []
-    should_test = stage in {"apply", "verify", "finalize", "archive"}
+    should_test = stage in {"apply", "review", "verify", "finalize", "archive"}
     if should_test:
-        commands = verification_commands(root, full=stage != "apply")
+        commands = verification_commands(root, stage)
         for index, command in enumerate(commands):
             if command and command[0] == "openspec.cmd" and os.name != "nt":
                 command = ["openspec", *command[1:]]

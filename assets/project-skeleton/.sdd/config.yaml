@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "distribution_version": "0.2.0",
+  "distribution_version": "0.2.1",
   "model": null,
   "executor": "opencode",
   "git": {

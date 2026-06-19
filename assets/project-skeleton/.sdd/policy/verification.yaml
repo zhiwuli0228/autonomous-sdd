@@ -3,15 +3,24 @@
   "commands": {
     "diff_check": ["git", "diff", "--check"],
     "openspec_validate": ["openspec.cmd", "validate", "--all", "--json"],
-    "project_test": []
+    "project_quick_check": [],
+    "project_full_test": []
   },
   "task_gate": [
     "diff_check",
-    "project_test"
+    "project_quick_check"
   ],
-  "full_gate": [
+  "review_gate": [
+    "diff_check",
+    "project_quick_check"
+  ],
+  "verify_gate": [
     "diff_check",
     "openspec_validate",
-    "project_test"
+    "project_full_test"
+  ],
+  "closeout_gate": [
+    "diff_check",
+    "openspec_validate"
   ]
 }
