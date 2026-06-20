@@ -244,6 +244,8 @@ python scripts\sdd.py init E:\path\to\project
 .\sdd.cmd run
 .\sdd.cmd status
 .\sdd.cmd recover
+.\sdd.cmd autorecover --retry-seconds 10
+.\sdd.cmd rehearse-recovery --task "<objective>" --retry-seconds 10 --json-out .sdd\runtime\rehearsal-summary.json --artifacts-dir .sdd\runtime\rehearsal-artifacts
 ```
 
 普通比赛执行不需要手工调用这些命令。
@@ -267,6 +269,7 @@ python -m py_compile scripts\sdd.py tests\test_runner.py
 - OpenSpec 归档和主规格同步。
 - 命令超时后完整回收子进程树；
 - Runner 按稳定任务 ID 托管勾选并拒绝无实质变更。
+- 支持在中断后自动回滚到最后验证检查点并续跑。
 
 ## 当前状态
 

@@ -20,10 +20,24 @@ import signal
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+
+def _add_repo_root_to_sys_path() -> None:
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / "autonomous_sdd").is_dir():
+            sys.path.insert(0, str(candidate))
+            return
+
+
+_add_repo_root_to_sys_path()
+
+from autonomous_sdd import create_runtime_services
+from autonomous_sdd.repository import Repository
 
 
 VERSION = "0.3.0"
@@ -74,6 +88,12 @@ REQUIRED_SECTIONS = {
 
 class SddError(RuntimeError):
     pass
+
+
+class SddExit(SddError):
+    def __init__(self, message: str, exit_code: int) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
 
 
 def now() -> str:
@@ -270,6 +290,7 @@ def linux_execution_lock(root: Path):
 def pid_file_execution_lock(root: Path):
     path = sdd_dir(root) / "runtime" / "execution.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + 5
     while True:
         try:
             descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -283,6 +304,9 @@ def pid_file_execution_lock(root: Path):
             except (SddError, TypeError, ValueError):
                 pid = -1
             if process_is_alive(pid):
+                if time.time() < deadline:
+                    time.sleep(0.1)
+                    continue
                 raise SddError(f"Another Runner owns the workspace lock: pid={pid}")
             path.unlink(missing_ok=True)
     try:
@@ -304,7 +328,11 @@ def execution_lock(root: Path):
 
 
 def validate_execution_preflight(root: Path, state: dict[str, Any]) -> None:
-    changed = git_changed(root)
+    changed = [
+        path
+        for path in git_changed(root)
+        if path != f"openspec/changes/{state['change_id']}/.openspec.yaml"
+    ]
     if state.get("status") == "running" and changed:
         raise SddError(
             "Running state must start from a clean verified checkpoint; unexpected changes:\n- "
@@ -447,43 +475,367 @@ def ensure_runtime_ignores(root: Path) -> None:
 
 
 def compete(args: argparse.Namespace) -> None:
-    root = project_root(args.project)
-    objective = read_task(args.task, root)
-    preexisting_git = (root / ".git").exists()
-    if preexisting_git and git_changed(root):
-        raise SddError("One-command competition execution requires a clean repository before start")
-    if not (root / ".sdd").exists():
-        init_project(argparse.Namespace(project=str(root), force=False))
-    ensure_git_identity(root)
-    detected = detect_project(root)
-    configure_detected_project(root, detected)
-    config = load_config(root)
+    source_root = project_root(args.project)
+    objective = read_task(args.task, source_root)
+    if not (source_root / ".sdd").exists():
+        init_project(argparse.Namespace(project=str(source_root), force=False))
+    active_root = active_runtime_root(source_root)
+    if active_root is not None:
+        assert_compete_request_matches_active_run(
+            active_root,
+            objective=objective,
+            change_id=args.change_id,
+            executor=args.executor,
+        )
+        try:
+            run_loop(argparse.Namespace(project=str(active_root), max_steps=args.max_steps))
+        except Exception:
+            if load_state(active_root).get("status") in {"closed", "blocked"}:
+                final = finalize_competition_run(active_root, source_root)
+                raise_compete_result(active_root, final)
+            raise
+        final = finalize_competition_run(active_root, source_root)
+        raise_compete_result(active_root, final)
+        return
+    ensure_git_identity(source_root)
+    detected = detect_project(source_root)
+    configure_detected_project(source_root, detected)
+    config = load_config(source_root)
     config["executor"] = args.executor
-    save_config(root, config)
-    if not preexisting_git or not git(root, "rev-parse", "--verify", "HEAD", check=False):
-        commit_all(root, "chore: establish competition baseline")
+    save_config(source_root, config)
+    if not git(source_root, "rev-parse", "--verify", "HEAD", check=False):
+        commit_all(source_root, "chore: establish competition baseline")
     else:
-        commit_all(root, "chore: install autonomous competition harness")
-    baseline(argparse.Namespace(project=str(root)))
-    change_id = unique_change_id(root, args.change_id or slugify(objective))
-    start(argparse.Namespace(project=str(root), change_id=change_id, objective=objective))
+        commit_all(source_root, "chore: install autonomous competition harness")
+    baseline(argparse.Namespace(project=str(source_root)))
+    services = create_runtime_services(source_root)
+    root = None
     try:
+        with services.locks():
+            snapshot = services.workspace.initialize(VERSION)
+        write_active_run_locator(
+            source_root,
+            {
+                "run_id": snapshot.work_root.parent.name,
+                "run_root": str(snapshot.work_root.parent),
+                "work_project_root": str(snapshot.work_root),
+                "source_root": str(source_root),
+            },
+        )
+        root = services.workspace.work_project_root
+        change_id = unique_change_id(root, args.change_id or slugify(objective))
+        start(
+            argparse.Namespace(
+                project=str(root),
+                change_id=change_id,
+                objective=objective,
+                source_root=str(snapshot.source_root),
+                work_root=str(snapshot.work_root),
+                source_head=snapshot.source_head,
+                baseline_commit=snapshot.baseline_commit,
+                run_branch=snapshot.run_branch,
+                source_status=snapshot.source_status.to_dict(),
+            )
+        )
         run_loop(argparse.Namespace(project=str(root), max_steps=args.max_steps))
-    finally:
-        if state_path(root).exists():
+    except Exception:
+        if root is not None and state_path(root).exists():
             state = load_state(root)
-            if state["status"] in {"closed", "blocked"}:
-                report = emit_final_report(root, state)
-                if git_changed(root):
-                    final_commit = commit_all(root, f"sdd({state['change_id']}): record final delivery")
-                    state["delivery_report"] = rel(root, report)
-                    state["delivery_commit"] = final_commit
-                    save_state(root, state)
-    final = load_state(root)
-    print(f"RESULT={final['status'].upper()}")
-    print(f"REPORT={sdd_dir(root) / 'delivery-report.md'}")
-    if final["status"] != "closed":
-        raise SddError(f"Competition run ended as {final['status']}")
+            if state.get("status") in {"closed", "blocked"}:
+                final = finalize_competition_run(root, source_root)
+                raise_compete_result(root, final)
+        elif services.workspace.run_dir.exists():
+            shutil.rmtree(services.workspace.run_dir, ignore_errors=True)
+            clear_active_run_locator(source_root)
+        raise
+    else:
+        if root is not None and state_path(root).exists():
+            final = finalize_competition_run(root, source_root)
+            raise_compete_result(root, final)
+
+
+def mirror_worktree(source: Path, target: Path) -> None:
+    if source.resolve() == target.resolve():
+        return
+    remove_missing_targets(source, target)
+    for path in source.rglob("*"):
+        if ".git" in path.parts:
+            continue
+        relative = path.relative_to(source)
+        destination = target / relative
+        if path.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_symlink():
+            if destination.exists() or destination.is_symlink():
+                if destination.is_dir() and not destination.is_symlink():
+                    shutil.rmtree(destination)
+                else:
+                    destination.unlink()
+            destination.symlink_to(os.readlink(path), target_is_directory=path.is_dir())
+        else:
+            shutil.copy2(path, destination)
+
+
+def write_active_run_locator(source_root: Path, payload: dict[str, Any]) -> None:
+    locator = source_root / ".sdd" / "runtime" / "active-run.json"
+    atomic_json(locator, payload)
+
+
+def clear_active_run_locator(source_root: Path) -> None:
+    locator = source_root / ".sdd" / "runtime" / "active-run.json"
+    locator.unlink(missing_ok=True)
+
+
+def load_active_run_locator(project: Path) -> dict[str, Any] | None:
+    locator = project / ".sdd" / "runtime" / "active-run.json"
+    if not locator.exists():
+        return None
+    return load_json(locator)
+
+
+def active_runtime_root(project: Path) -> Path | None:
+    try:
+        root = resolve_runtime_root(project)
+    except SddError:
+        return None
+    state = load_state(root)
+    if state.get("status") in {"closed", "blocked"}:
+        if load_active_run_locator(project) is not None:
+            clear_active_run_locator(project)
+        return None
+    return root
+
+
+def assert_compete_request_matches_active_run(
+    root: Path,
+    *,
+    objective: str,
+    change_id: str | None,
+    executor: str,
+) -> dict[str, Any]:
+    state = load_state(root)
+    if change_id and state.get("change_id") != change_id:
+        raise SddError(f"Active run change_id mismatch: requested {change_id}, active {state.get('change_id')}")
+    if state.get("objective") != objective:
+        raise SddError("Active run objective does not match the requested competition task")
+    active_executor = state.get("executor", load_config(root).get("executor", "opencode"))
+    if active_executor != executor:
+        raise SddError(f"Active run executor mismatch: requested {executor}, active {active_executor}")
+    return state
+
+
+def finalize_competition_run(root: Path, source_root: Path) -> dict[str, Any]:
+    state = load_state(root)
+    drift = source_workspace_drift(root, state, source_root)
+    if drift:
+        state["status"] = "blocked"
+        state["blocking_reason"] = (
+            "Source workspace changed since run started; cannot materialize final state automatically:\n- "
+            + "\n- ".join(drift)
+        )
+        save_state(root, state)
+    report = emit_final_report(root, state)
+    if git_changed(root):
+        final_commit = commit_all(root, f"sdd({state['change_id']}): record final delivery")
+        state["delivery_report"] = rel(root, report)
+        state["delivery_commit"] = final_commit
+        save_state(root, state)
+        state = load_state(root)
+    if drift:
+        return state
+    mirror_worktree(root, source_root)
+    source_delivery_commit = git_head(source_root)
+    if git_changed(source_root):
+        ensure_git_identity(source_root)
+        source_delivery_commit = commit_all(source_root, f"sdd({state['change_id']}): materialize final delivery")
+    state["delivery_commit"] = source_delivery_commit
+    state["delivery_report"] = ".sdd/delivery-report.md"
+    save_state(root, state)
+    if root.resolve() != source_root.resolve():
+        save_state(source_root, state)
+    clear_active_run_locator(source_root)
+    return state
+
+
+def source_workspace_drift(root: Path, state: dict[str, Any], source_root: Path) -> list[str]:
+    if root.resolve() == source_root.resolve():
+        return []
+    if not source_root.exists():
+        return [f"source workspace is missing: {source_root}"]
+    repository = Repository(source_root)
+    expected_head = state.get("source_head")
+    current_head = repository.head()
+    expected_status = normalize_repository_status(state.get("source_status"))
+    current_status = normalize_repository_status(repository.status().to_dict())
+    drift: list[str] = []
+    if current_head != expected_head:
+        drift.append(f"source HEAD changed from {expected_head} to {current_head}")
+    if current_status != expected_status:
+        drift.append("source workspace status changed since run start")
+    return drift
+
+
+def normalize_repository_status(value: Any) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        value = {}
+    normalized: dict[str, list[str]] = {}
+    for key in ("staged", "unstaged", "untracked", "conflicted"):
+        entries = value.get(key, [])
+        if not isinstance(entries, list):
+            entries = []
+        normalized[key] = sorted(str(entry).replace("\\", "/") for entry in entries)
+    return normalized
+
+
+def compete_result_payload(root: Path, state: dict[str, Any]) -> dict[str, Any]:
+    if state_path(root).exists():
+        merged_state = load_state(root)
+        merged_state.update(state)
+        state = merged_state
+    decision = compete_decision(state)
+    report_root = Path(str(state.get("source_root") or root))
+    if not (sdd_dir(report_root) / "delivery-report.md").exists():
+        report_root = root
+    report_path = sdd_dir(report_root) / "delivery-report.md"
+    return {
+        "kind": "competition_result",
+        "status": state["status"],
+        "run_id": state["run_id"],
+        "change_id": state["change_id"],
+        "objective": state["objective"],
+        "report": str(report_path),
+        "delivery_commit": state.get("delivery_commit"),
+        "decision": decision["decision"],
+        "reason": decision["reason"],
+        "recommended_action": decision["recommended_action"],
+        "exit_code": compete_exit_code(decision),
+    }
+
+
+def emit_compete_result(root: Path, state: dict[str, Any]) -> None:
+    payload = compete_result_payload(root, state)
+    print(f"RESULT={payload['status'].upper()}")
+    print(f"REPORT={payload['report']}")
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+def compete_decision(state: dict[str, Any]) -> dict[str, str]:
+    status = state["status"]
+    if status == "closed":
+        return {
+            "decision": "completed",
+            "reason": "Competition run completed and final delivery was materialized.",
+            "recommended_action": "none",
+        }
+    if status == "blocked":
+        return {
+            "decision": "blocked",
+            "reason": state.get("blocking_reason", "Competition run stopped in a blocked state."),
+            "recommended_action": "manual_repair",
+        }
+    return {
+        "decision": "manual_review",
+        "reason": f"Competition run ended in unexpected status: {status}",
+        "recommended_action": "manual_review",
+    }
+
+
+def compete_exit_code(decision: dict[str, str]) -> int:
+    mapping = {
+        "completed": 0,
+        "blocked": 4,
+        "manual_review": 2,
+    }
+    return mapping.get(decision["decision"], 2)
+
+
+def raise_compete_result(root: Path, state: dict[str, Any]) -> None:
+    payload = compete_result_payload(root, state)
+    print(f"RESULT={payload['status'].upper()}")
+    print(f"REPORT={payload['report']}")
+    print(json.dumps(payload, ensure_ascii=False))
+    if payload["exit_code"] != 0:
+        raise SddExit(payload["reason"], payload["exit_code"])
+
+
+def resolve_resume_root(project: Path) -> Path:
+    locator = load_active_run_locator(project)
+    if locator is not None:
+        work_root = Path(str(locator["work_project_root"]))
+        if work_root.exists() and state_path(work_root).exists():
+            return work_root
+        raise SddError(f"Recorded work copy is missing: {work_root}")
+    if state_path(project).exists():
+        return project
+    raise SddError(f"No resumable run found in {project}")
+
+
+def resume(args: argparse.Namespace) -> None:
+    project = project_root(args.project)
+    locator = load_active_run_locator(project)
+    root = resolve_resume_root(project)
+    with execution_lock(root):
+        state = load_state(root)
+        if state["status"] in {"closed", "blocked"}:
+            print(json.dumps(state, indent=2, ensure_ascii=False))
+            if locator is not None:
+                clear_active_run_locator(Path(str(locator["source_root"])))
+            return
+        if state.get("pending_action") == "gate":
+            gate_and_advance(root)
+            if load_state(root)["status"] in {"closed", "blocked"} and locator is not None:
+                clear_active_run_locator(Path(str(locator["source_root"])))
+            return
+        if state.get("pending_action") != "execute_stage":
+            raise SddError(f"Cannot resume run with pending action: {state.get('pending_action')}")
+        if state["status"] == "repair_required":
+            restore_verified_checkpoint(root, state)
+            state["status"] = "running"
+            save_state(root, state)
+        if state["status"] != "running":
+            raise SddError(f"Cannot resume run in status: {state['status']}")
+        if not args.dry_run:
+            validate_execution_preflight(root, state)
+        execute_stage(root, state, args.dry_run)
+        if args.dry_run:
+            return
+        state = load_state(root)
+        state["pending_action"] = "gate"
+        save_state(root, state)
+        gate_and_advance(root)
+        if load_state(root)["status"] in {"closed", "blocked"} and locator is not None:
+            clear_active_run_locator(Path(str(locator["source_root"])))
+
+
+def remove_missing_targets(source: Path, target: Path) -> None:
+    for path in sorted(target.rglob("*"), reverse=True):
+        if ".git" in path.parts:
+            continue
+        relative = path.relative_to(target)
+        if (source / relative).exists() or (source / relative).is_symlink():
+            continue
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+
+def restore_verified_checkpoint(root: Path, state: dict[str, Any]) -> None:
+    commit = state.get("last_verified_commit")
+    if not commit:
+        raise SddError("Cannot restore workspace without last_verified_commit")
+    if not git_changed(root):
+        return
+    git(root, "reset", "--hard", commit)
+    git(root, "clean", "-fd")
+    directory = change_dir(root, state)
+    directory.mkdir(parents=True, exist_ok=True)
+    schema_path = directory / ".openspec.yaml"
+    if not schema_path.exists():
+        schema_path.write_text("schema: autonomous-superspec\n", encoding="utf-8")
+    append_journal(root, {"event": "workspace_restored", "stage": state.get("stage"), "commit": commit})
 
 
 def detect_project(root: Path) -> dict[str, Any]:
@@ -760,6 +1112,8 @@ def baseline(args: argparse.Namespace) -> None:
     api_policy = load_json(sdd_dir(root) / "policy" / "api-contract.yaml")
     protected_patterns = competition["modification"]["forbidden"]
     protected_patterns += api_policy["public_api"]["protected_paths"]
+    manifest_path = sdd_dir(root) / "baseline" / "manifest.json"
+    manifest_key = rel(root, manifest_path)
     manifest = {
         "schema_version": 1,
         "created_at": now(),
@@ -769,7 +1123,9 @@ def baseline(args: argparse.Namespace) -> None:
         "protected_files": capture_files(root, protected_patterns),
         "dependency_files": capture_files(root, competition["dependencies"]["manifest_paths"]),
     }
-    atomic_json(sdd_dir(root) / "baseline" / "manifest.json", manifest)
+    manifest["protected_files"].pop(manifest_key, None)
+    manifest["dependency_files"].pop(manifest_key, None)
+    atomic_json(manifest_path, manifest)
     print(f"Baseline captured at {manifest['git_head']} ({len(manifest['protected_files'])} protected files)")
 
 
@@ -796,8 +1152,16 @@ def start(args: argparse.Namespace) -> None:
         "run_id": f"{dt.datetime.now():%Y%m%d%H%M%S}-{uuid.uuid4().hex[:8]}",
         "change_id": change,
         "objective": args.objective,
+        "executor": getattr(args, "executor", load_config(root).get("executor", "opencode")),
+        "source_root": getattr(args, "source_root", str(root)),
+        "work_root": getattr(args, "work_root", str(root)),
+        "source_head": getattr(args, "source_head", None),
+        "baseline_commit": getattr(args, "baseline_commit", None),
+        "run_branch": getattr(args, "run_branch", None),
+        "source_status": getattr(args, "source_status", None),
         "stage": "brainstorm",
         "status": "running",
+        "pending_action": "execute_stage",
         "iteration": 0,
         "task": None,
         "baseline_commit": load_json(baseline_file)["git_head"],
@@ -1073,8 +1437,12 @@ def write_agent_result(root: Path, summary: str, changed: list[str], task_id: st
 def fixture_execute(root: Path, state: dict[str, Any]) -> None:
     """Deterministic lifecycle executor used to validate orchestration itself."""
     stage = state["stage"]
-    if load_config(root).get("fixture_fail_stage") == stage:
+    config = load_config(root)
+    if config.get("fixture_fail_stage") == stage:
         raise SddError(f"Injected deterministic failure at stage {stage}")
+    fixture_stage_delay_seconds = float(config.get("fixture_stage_delay_seconds", 0) or 0)
+    if fixture_stage_delay_seconds > 0:
+        time.sleep(fixture_stage_delay_seconds)
     directory = change_dir(root, state)
     changed: list[str] = []
     if stage == "brainstorm":
@@ -1149,7 +1517,8 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
         changed.append(rel(root, path))
     elif stage == "apply":
         task = current_task(root, state)
-        output = root / "src" / f"autonomous_sdd_rehearsal_{task['id'].replace('.', '_')}.txt"
+        change_token = state["change_id"].replace("-", "_")
+        output = root / "src" / f"autonomous_sdd_rehearsal_{change_token}_{task['id'].replace('.', '_')}.txt"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(f"deterministic competition rehearsal task {task['id']} completed\n", encoding="utf-8")
         changed.append(rel(root, output))
@@ -1206,6 +1575,9 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
         raise SddError(f"Fixture executor cannot execute stage: {stage}")
     task = current_task(root, state) if stage == "apply" else None
     write_agent_result(root, f"Fixture completed {stage}", changed, task["id"] if task else None)
+    fixture_post_stage_delay_seconds = float(config.get("fixture_post_stage_delay_seconds", 0) or 0)
+    if fixture_post_stage_delay_seconds > 0:
+        time.sleep(fixture_post_stage_delay_seconds)
 
 
 def main_spec_from_delta(delta: str, capability: str) -> str:
@@ -1259,7 +1631,7 @@ def invoke_agent(root: Path, state: dict[str, Any], dry_run: bool) -> None:
     result_path = sdd_dir(root) / "runtime" / "agent-result.json"
     if result_path.exists():
         result_path.unlink()
-    if config.get("executor", "opencode") == "fixture":
+    if state.get("executor", config.get("executor", "opencode")) == "fixture":
         fixture_execute(root, state)
         append_journal(root, {"event": "fixture_finished", "stage": state["stage"]})
         return
@@ -1433,7 +1805,7 @@ def execute_gates(root: Path, state: dict[str, Any]) -> tuple[list[str], list[di
     should_test = stage in {"apply", "review", "verify", "finalize", "archive"}
     if should_test:
         commands = verification_commands(root, stage)
-        if stage == "apply" and load_config(root).get("executor") != "fixture":
+        if stage == "apply" and state.get("executor", load_config(root).get("executor")) != "fixture":
             focused, focused_errors = focused_test_commands(root, git_changed(root))
             commands.extend(focused)
             errors.extend(focused_errors)
@@ -1527,6 +1899,7 @@ def gate_and_advance(root: Path) -> None:
     errors, evidence = execute_gates(root, state)
     if errors:
         state["status"] = "repair_required"
+        state["pending_action"] = "gate"
         key = state["stage"]
         state["retries"][key] = state["retries"].get(key, 0) + 1
         save_state(root, state)
@@ -1556,6 +1929,7 @@ def gate_and_advance(root: Path) -> None:
     state["last_verified_commit"] = commit
     state["last_handoff"] = rel(root, handoff)
     state["next_action"] = "emit_final_report" if next_stage == "closed" else "execute_stage"
+    state["pending_action"] = "execute_stage"
     state["iteration"] += 1
     state["retries"].pop(completed, None)
     save_state(root, state)
@@ -1564,7 +1938,7 @@ def gate_and_advance(root: Path) -> None:
 
 
 def run_once(args: argparse.Namespace) -> None:
-    root = project_root(args.project)
+    root = resolve_runtime_root(project_root(args.project))
     with execution_lock(root):
         state = load_state(root)
         if state["status"] == "closed":
@@ -1578,11 +1952,11 @@ def run_once(args: argparse.Namespace) -> None:
 
 
 def gate(args: argparse.Namespace) -> None:
-    gate_and_advance(project_root(args.project))
+    gate_and_advance(resolve_runtime_root(project_root(args.project)))
 
 
 def run_loop(args: argparse.Namespace) -> None:
-    root = project_root(args.project)
+    root = resolve_runtime_root(project_root(args.project))
     with execution_lock(root):
         steps = 0
         while steps < args.max_steps:
@@ -1594,8 +1968,21 @@ def run_loop(args: argparse.Namespace) -> None:
                 return
             try:
                 validate_execution_preflight(root, state)
-                execute_stage(root, state, False)
-                gate_and_advance(root)
+                pending_action = state.get("pending_action", "execute_stage")
+                if pending_action == "gate":
+                    gate_and_advance(root)
+                elif pending_action == "execute_stage":
+                    if state["status"] == "repair_required":
+                        restore_verified_checkpoint(root, state)
+                        state["status"] = "running"
+                        save_state(root, state)
+                    execute_stage(root, state, False)
+                    state = load_state(root)
+                    state["pending_action"] = "gate"
+                    save_state(root, state)
+                    gate_and_advance(root)
+                else:
+                    raise SddError(f"Cannot continue run with pending action: {pending_action}")
             except SddError as exc:
                 state = load_state(root)
                 key = state["stage"]
@@ -1648,13 +2035,145 @@ def emit_final_report(root: Path, state: dict[str, Any]) -> Path:
 
 
 def status(args: argparse.Namespace) -> None:
-    root = project_root(args.project)
-    print(json.dumps(load_state(root), indent=2, ensure_ascii=False))
+    root = resolve_runtime_root(project_root(args.project))
+    print(json.dumps(runtime_overview(root), indent=2, ensure_ascii=False))
 
 
 def recover(args: argparse.Namespace) -> None:
-    root = project_root(args.project)
+    requested_project = project_root(args.project)
+    result = recovery_report(requested_project)
+    root = resolve_runtime_root(requested_project)
+    atomic_json(sdd_dir(root) / "runtime" / "recovery.json", result)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    if result["exit_code"] != 0:
+        raise SddExit(result["reason"], result["exit_code"])
+
+
+def autorecover(args: argparse.Namespace) -> None:
+    requested_project = project_root(args.project)
+    deadline = time.time() + max(0, float(getattr(args, "retry_seconds", 0) or 0))
+    while True:
+        result = recovery_report(requested_project)
+        root = resolve_runtime_root(requested_project)
+        atomic_json(sdd_dir(root) / "runtime" / "recovery.json", result)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        action = result["recommended_action"]
+        try:
+            if action == "resume":
+                resume(argparse.Namespace(project=str(requested_project), dry_run=args.dry_run))
+                return
+            if action == "restore_and_resume":
+                if not args.dry_run:
+                    restore_verified_checkpoint(root, load_state(root))
+                resume(argparse.Namespace(project=str(requested_project), dry_run=args.dry_run))
+                return
+            if action == "none":
+                return
+            raise SddExit(result["reason"], result["exit_code"])
+        except SddError as exc:
+            if "Another Runner owns the workspace lock" in str(exc) and time.time() < deadline:
+                time.sleep(0.2)
+                continue
+            raise
+
+
+def resolve_output_path(root: Path, value: str | None) -> Path | None:
+    if not value:
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    return candidate.resolve()
+
+
+def rehearse_recovery(args: argparse.Namespace) -> None:
+    source_root = project_root(args.project)
+    if not (source_root / ".sdd").exists():
+        init_project(argparse.Namespace(project=str(source_root), force=False))
+    ensure_git_identity(source_root)
+    baseline_file = sdd_dir(source_root) / "baseline" / "manifest.json"
+    if not baseline_file.exists():
+        baseline(argparse.Namespace(project=str(source_root)))
+    services = create_runtime_services(source_root)
+    with services.locks():
+        snapshot = services.workspace.initialize(VERSION)
+    root = services.workspace.work_project_root
+    objective = read_task(args.task, source_root)
+    change_id = unique_change_id(root, args.change_id or slugify(objective))
+    start(
+        argparse.Namespace(
+            project=str(root),
+            change_id=change_id,
+            objective=objective,
+            executor="fixture",
+            source_root=str(source_root),
+            work_root=str(snapshot.work_root),
+            source_head=snapshot.source_head,
+            baseline_commit=snapshot.baseline_commit,
+            run_branch=snapshot.run_branch,
+            source_status=snapshot.source_status.to_dict(),
+        )
+    )
+    write_active_run_locator(
+        source_root,
+        {
+            "run_id": snapshot.work_root.parent.name,
+            "run_root": str(snapshot.work_root.parent),
+            "work_project_root": str(root),
+            "source_root": str(source_root),
+        },
+    )
+    lock_path = root / ".sdd" / "runtime" / "execution.lock"
+    lock_path.write_text(json.dumps({"pid": 999999, "created_at": now()}), encoding="utf-8")
+    recovery = recovery_report(source_root)
+    autorecover(
+        argparse.Namespace(
+            project=str(source_root),
+            dry_run=False,
+            retry_seconds=args.retry_seconds,
+        )
+    )
+    compete(
+        argparse.Namespace(
+            project=str(source_root),
+            task=objective,
+            change_id=change_id,
+            executor="fixture",
+            max_steps=args.max_steps,
+        )
+    )
+    final_state = load_state(source_root)
+    artifacts_dir = resolve_output_path(source_root, getattr(args, "artifacts_dir", None))
+    if artifacts_dir is not None:
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        atomic_json(artifacts_dir / "initial-recovery.json", recovery)
+        atomic_json(artifacts_dir / "final-state.json", final_state)
+    payload = {
+        "kind": "recovery_rehearsal_result",
+        "project": str(source_root),
+        "change_id": change_id,
+        "objective": objective,
+        "initial_recovery_decision": recovery["decision"],
+        "initial_recommended_action": recovery["recommended_action"],
+        "final_status": final_state["status"],
+        "delivery_commit": final_state.get("delivery_commit"),
+        "report": str(source_root / ".sdd" / "delivery-report.md"),
+        "json_out": str(resolve_output_path(source_root, getattr(args, "json_out", None))) if getattr(args, "json_out", None) else None,
+        "artifacts_dir": str(artifacts_dir) if artifacts_dir is not None else None,
+    }
+    json_out = resolve_output_path(source_root, getattr(args, "json_out", None))
+    if json_out is not None:
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json(json_out, payload)
+    if artifacts_dir is not None:
+        atomic_json(artifacts_dir / "rehearsal-result.json", payload)
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+def recovery_report(requested_project: Path) -> dict[str, Any]:
+    root = resolve_runtime_root(requested_project)
     state = load_state(root)
+    metadata = runtime_metadata(root)
     errors = validate_controls(root)
     handoff_path = sdd_dir(root) / "runtime" / "current-handoff.json"
     if state.get("last_handoff") and not handoff_path.exists():
@@ -1664,18 +2183,162 @@ def recover(args: argparse.Namespace) -> None:
     changed = git_changed(root)
     if state.get("status") == "running" and changed:
         errors.append("Running state has unexpected uncommitted changes: " + ", ".join(changed))
-    result = {
+    decision = recovery_decision(state, errors, bool(changed))
+    command = recovery_command(requested_project, decision)
+    plan = recovery_plan(decision, command)
+    exit_code = recovery_exit_code(decision)
+    return {
         "status": "FAIL" if errors else "PASS",
         "run_id": state["run_id"],
         "stage": state["stage"],
         "git_head": git_head(root),
+        "workspace": metadata,
         "errors": errors,
         "next_action": state["next_action"],
+        "decision": decision["decision"],
+        "recommended_action": decision["recommended_action"],
+        "resume_supported": decision["recommended_action"] in {"resume", "restore_and_resume"},
+        "reason": decision["reason"],
+        "recommended_command": command,
+        "recovery_plan": plan,
+        "exit_code": exit_code,
     }
-    atomic_json(sdd_dir(root) / "runtime" / "recovery.json", result)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def recovery_decision(state: dict[str, Any], errors: list[str], dirty: bool) -> dict[str, str]:
+    status = state.get("status")
+    if status == "closed":
+        return {
+            "decision": "closed",
+            "recommended_action": "none",
+            "reason": "Run is already closed",
+        }
+    if status == "blocked":
+        return {
+            "decision": "blocked",
+            "recommended_action": "manual_repair",
+            "reason": state.get("blocking_reason", "Run is blocked"),
+        }
+    if status in {"running", "repair_required"} and dirty and state.get("last_verified_commit"):
+        return {
+            "decision": "restore_ready",
+            "recommended_action": "restore_and_resume",
+            "reason": "Unverified in-progress changes detected; restore last verified commit and resume current stage",
+        }
     if errors:
-        raise SddError("Recovery failed")
+        return {
+            "decision": "manual_repair_required",
+            "recommended_action": "manual_repair",
+            "reason": errors[0],
+        }
+    pending_action = state.get("pending_action", "execute_stage")
+    if pending_action in {"execute_stage", "gate"}:
+        return {
+            "decision": "resume_ready",
+            "recommended_action": "resume",
+            "reason": f"Run can continue from pending action: {pending_action}",
+        }
+    return {
+        "decision": "manual_repair_required",
+        "recommended_action": "manual_repair",
+        "reason": f"Unsupported pending action: {pending_action}",
+    }
+
+
+def recovery_command(project: Path, decision: dict[str, str]) -> list[str]:
+    action = decision["recommended_action"]
+    if action == "resume":
+        return [sys.executable, str(project / ".sdd" / "bin" / "sdd.py"), "--project", str(project), "resume"]
+    if action == "restore_and_resume":
+        return [sys.executable, str(project / ".sdd" / "bin" / "sdd.py"), "--project", str(project), "autorecover"]
+    if action == "none":
+        return []
+    return []
+
+
+def recovery_plan(decision: dict[str, str], command: list[str]) -> list[dict[str, Any]]:
+    action = decision["recommended_action"]
+    if action == "resume":
+        return [
+            {
+                "kind": "execute",
+                "description": decision["reason"],
+                "command": command,
+            }
+        ]
+    if action == "restore_and_resume":
+        return [
+            {
+                "kind": "execute",
+                "description": decision["reason"],
+                "command": command,
+            }
+        ]
+    if action == "manual_repair":
+        return [
+            {
+                "kind": "manual",
+                "description": decision["reason"],
+                "command": [],
+            }
+        ]
+    return [
+        {
+            "kind": "noop",
+            "description": decision["reason"],
+            "command": [],
+        }
+    ]
+
+
+def recovery_exit_code(decision: dict[str, str]) -> int:
+    mapping = {
+        "resume_ready": 0,
+        "restore_ready": 0,
+        "closed": 0,
+        "manual_repair_required": 3,
+        "blocked": 4,
+    }
+    return mapping.get(decision["decision"], 2)
+
+
+def runtime_metadata(root: Path) -> dict[str, Any]:
+    state_path_value = state_path(root)
+    if not state_path_value.exists():
+        return {}
+    metadata = load_state(root)
+    work_root = metadata.get("work_root")
+    return {
+        "project_root": metadata.get("source_root", metadata.get("project_root")),
+        "work_root": work_root,
+        "work_project_root": str(root.resolve()),
+        "baseline_commit": metadata.get("baseline_commit"),
+        "run_branch": metadata.get("run_branch"),
+        "source_head": metadata.get("source_head"),
+        "source_status": metadata.get("source_status"),
+    }
+
+
+def runtime_overview(root: Path) -> dict[str, Any]:
+    overview: dict[str, Any] = {"workspace": runtime_metadata(root)}
+    state_path_value = state_path(root)
+    if state_path_value.exists():
+        overview["state"] = load_state(root)
+    else:
+        overview["state"] = None
+    return overview
+
+
+def resolve_runtime_root(project: Path) -> Path:
+    locator = load_active_run_locator(project)
+    if locator is not None:
+        work_root = Path(str(locator["work_project_root"]))
+        if work_root.exists() and state_path(work_root).exists():
+            return work_root
+        raise SddError(f"Recorded work copy is missing: {work_root}")
+    if state_path(project).exists():
+        return project
+    raise SddError(f"No runtime state found in {project}")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1714,6 +2377,30 @@ def parser() -> argparse.ArgumentParser:
     loop.add_argument("--max-steps", type=int, default=50)
     loop.set_defaults(func=run_loop)
 
+    resume_cmd = sub.add_parser("resume", help="Continue a resumable run from its latest checkpoint")
+    resume_cmd.add_argument("--dry-run", action="store_true")
+    resume_cmd.set_defaults(func=resume)
+
+    autorecover_cmd = sub.add_parser("autorecover", help="Recover a run and execute safe automatic recovery steps")
+    autorecover_cmd.add_argument("--dry-run", action="store_true")
+    autorecover_cmd.add_argument("--retry-seconds", type=float, default=0)
+    autorecover_cmd.set_defaults(func=autorecover)
+
+    rehearse_recovery_cmd = sub.add_parser(
+        "rehearse-recovery",
+        help="Create a deterministic interrupted run, recover it automatically, and finish the workflow",
+    )
+    rehearse_recovery_cmd.add_argument("--task", required=True, help="Task file path or inline task text")
+    rehearse_recovery_cmd.add_argument("--change-id", help="Optional kebab-case change identifier")
+    rehearse_recovery_cmd.add_argument("--max-steps", type=int, default=50)
+    rehearse_recovery_cmd.add_argument("--retry-seconds", type=float, default=10)
+    rehearse_recovery_cmd.add_argument("--json-out", help="Optional path to write the final rehearsal summary JSON")
+    rehearse_recovery_cmd.add_argument(
+        "--artifacts-dir",
+        help="Optional directory to write rehearsal artifacts such as initial recovery and final state JSON",
+    )
+    rehearse_recovery_cmd.set_defaults(func=rehearse_recovery)
+
     sub.add_parser("status", help="Print machine state").set_defaults(func=status)
     sub.add_parser("recover", help="Validate and recover a run").set_defaults(func=recover)
     sub.add_parser("migrate-tasks", help="Collapse legacy nested checkboxes into bounded tasks").set_defaults(
@@ -1727,6 +2414,9 @@ def main() -> int:
     try:
         args.func(args)
         return 0
+    except SddExit as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return exc.exit_code
     except (SddError, subprocess.TimeoutExpired) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
