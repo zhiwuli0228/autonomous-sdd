@@ -8,7 +8,25 @@
   },
   "timeouts": {
     "agent_seconds": 1200,
+    "stage_agent_seconds": {
+      "brainstorm": 600,
+      "proposal": 1200,
+      "specs": 1800,
+      "design": 2400,
+      "tasks": 1200,
+      "plan": 1200,
+      "apply": 2400,
+      "review": 1800,
+      "verify": 1800,
+      "finalize": 600,
+      "archive": 300,
+      "retrospective": 600
+    },
     "focused_test_seconds": 300,
     "verification_seconds": 3600
+  },
+  "budget": {
+    "maximum_stage_retries": 1,
+    "maximum_repeated_failure_signatures": 4
   }
 }

@@ -43,6 +43,74 @@ from autonomous_sdd.repository import Repository
 VERSION = "0.3.0"
 MIN_APPLY_TASKS = 3
 MAX_APPLY_TASKS = 20
+DEFAULT_COMPETITION_GOAL = (
+    "Modify the target C++ packaging project to support custom header payload content provided by a parameter "
+    "while preserving unpack correctness, build entry compatibility, original CLI compatibility, skill delivery, "
+    "and verification completeness."
+)
+DEFAULT_COMPETITION_CONSTRAINTS = [
+    "Support custom header payload content through a parameter.",
+    "The custom header payload content length is variable and must be parsed correctly.",
+    "Unpack must still work correctly after customization.",
+    "The project build entrypoint must remain unchanged.",
+    "The original packaging tool invocation must still work with its original arguments.",
+    "Backward compatibility with existing callers must be preserved.",
+    "A callable skill for the packaging tool must be delivered.",
+    "The skill must support THX-related handling and header inspection.",
+    "Reasonable tests must be designed from the codebase structure to validate the change.",
+]
+DEFAULT_ACCEPTANCE_INVARIANTS = [
+    "variable_length_header_payload",
+    "successful_unpack_after_customization",
+    "unchanged_build_entrypoint",
+    "original_cli_compatibility",
+    "skill_delivery_required",
+    "validation_tests_required",
+]
+DEFAULT_TOOLING_INTEGRATION_CONSTRAINTS = {
+    "formatter_tool_available": False,
+    "formatter_invocation_hint": None,
+    "formatter_expected_evidence": None,
+    "optional_tooling": [
+        "future internal formatter/checker may arrive via MCP",
+        "future internal formatter/checker may arrive via Skill",
+        "future internal formatter/checker may arrive via IDEA plugin integration",
+    ],
+}
+COMPETITION_REQUIREMENT_THEMES = {
+    "custom_header_payload": [
+        "custom header",
+        "header payload",
+        "variable-length header",
+        "variable length header",
+        "variable_length_header_payload",
+        "custom_header_payload",
+    ],
+    "unpack_correctness": [
+        "unpack",
+        "successful_unpack_after_customization",
+        "unpack_correctness",
+    ],
+    "compatibility": [
+        "compatibility",
+        "backward compatibility",
+        "backward-compatible",
+        "source-compatible",
+        "existing callers",
+        "legacy cli",
+        "original cli",
+        "build entrypoint",
+        "original_cli_compatibility",
+        "unchanged_build_entrypoint",
+    ],
+    "skill_delivery": [
+        "skill",
+        "header inspection",
+        "thx",
+        "skill_delivery_required",
+        "validation_tests_required",
+    ],
+}
 STAGES = [
     "brainstorm",
     "proposal",
@@ -213,6 +281,72 @@ def save_config(root: Path, config: dict[str, Any]) -> None:
     atomic_json(sdd_dir(root) / "config.yaml", config)
 
 
+def budget_value(root: Path, key: str, default: int) -> int:
+    budget = load_config(root).get("budget", {})
+    value = budget.get(key, default)
+    return value if isinstance(value, int) and value > 0 else default
+
+
+def agent_timeout_for_state(root: Path, state: dict[str, Any]) -> int:
+    config = load_config(root)
+    timeouts = config.get("timeouts", {})
+    stage_timeouts = timeouts.get("stage_agent_seconds", {})
+    stage = state.get("stage", "")
+    if isinstance(stage_timeouts, dict):
+        value = stage_timeouts.get(stage)
+        if isinstance(value, int) and value > 0:
+            return value
+    fallback = timeouts.get("agent_seconds", 1200)
+    return fallback if isinstance(fallback, int) and fallback > 0 else 1200
+
+
+def normalize_failure_signature(stage: str, message: str) -> str:
+    text = (message or "").strip()
+    if "timed out after" in text.lower():
+        return f"{stage}:agent_timeout"
+    if "opencode invocation failed" in text.lower():
+        return f"{stage}:agent_exit_nonzero"
+    if text.startswith("Gate failed:"):
+        lines = [line.strip() for line in text.splitlines()[1:] if line.strip()]
+        normalized = " | ".join(lines[:3]) if lines else "gate_failed"
+        return f"{stage}:gate:{normalized}"
+    first = text.splitlines()[0].strip().lower() if text else "unknown"
+    first = re.sub(r"\s+", " ", first)
+    return f"{stage}:{first[:160]}"
+
+
+def record_failure_signature(root: Path, state: dict[str, Any], message: str) -> tuple[str, int]:
+    signature = normalize_failure_signature(state["stage"], message)
+    signatures = state.setdefault("failure_signatures", {})
+    count = int(signatures.get(signature, 0)) + 1
+    signatures[signature] = count
+    state["last_failure_signature"] = signature
+    append_journal(
+        root,
+        {
+            "event": "failure_signature_recorded",
+            "stage": state["stage"],
+            "signature": signature,
+            "count": count,
+        },
+    )
+    return signature, count
+
+
+def stage_retry_budget(root: Path) -> int:
+    return budget_value(root, "maximum_stage_retries", 1)
+
+
+def clear_failure_signature(root: Path, state: dict[str, Any], stage: str) -> None:
+    prefix = f"{stage}:"
+    signatures = state.setdefault("failure_signatures", {})
+    for key in list(signatures):
+        if key.startswith(prefix):
+            signatures.pop(key, None)
+    if isinstance(state.get("last_failure_signature"), str) and state["last_failure_signature"].startswith(prefix):
+        state.pop("last_failure_signature", None)
+
+
 def process_is_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -332,6 +466,7 @@ def validate_execution_preflight(root: Path, state: dict[str, Any]) -> None:
         path
         for path in git_changed(root)
         if path != f"openspec/changes/{state['change_id']}/.openspec.yaml"
+        and not (state.get("stage") == "apply" and is_ephemeral_build_output(path))
     ]
     if state.get("status") == "running" and changed:
         raise SddError(
@@ -381,6 +516,54 @@ def git_changed(root: Path) -> list[str]:
                 )
             else:
                 changed.append(path)
+    return sorted(set(changed))
+
+
+def is_ephemeral_build_output(path: str) -> bool:
+    normalized = path.replace("\\", "/").strip("./")
+    if normalized.startswith(
+        ("build/", "build\\", "out/", "out\\", "dist/", "dist\\", "sdd/tmp/focused-build/")
+    ):
+        return True
+    if normalized.endswith((".obj", ".o", ".a", ".so", ".dll", ".dylib", ".exe", ".class")):
+        return True
+    return False
+
+
+def is_substantive_sdd_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.startswith(".sdd/skills/")
+
+
+def git_path_changed_from_head(root: Path, path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    if not (root / normalized).is_file():
+        return False
+    tracked = run_command(["git", "ls-files", "--error-unmatch", normalized], root, timeout=120, check=False)
+    if tracked.returncode != 0:
+        return True
+    diff = run_command(["git", "diff", "--quiet", "HEAD", "--", normalized], root, timeout=120, check=False)
+    return diff.returncode != 0
+
+
+def substantive_changed_paths(root: Path) -> list[str]:
+    changed = [
+        path
+        for path in git_changed(root)
+        if not path.startswith("openspec/")
+        and (not path.startswith(".sdd/") or is_substantive_sdd_path(path))
+        and not is_ephemeral_build_output(path)
+    ]
+    skills_root = sdd_dir(root) / "skills"
+    if skills_root.exists():
+        for path in skills_root.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = rel(root, path)
+            if is_substantive_sdd_path(relative) and git_path_changed_from_head(root, relative):
+                changed.append(relative)
     return sorted(set(changed))
 
 
@@ -476,7 +659,8 @@ def ensure_runtime_ignores(root: Path) -> None:
 
 def compete(args: argparse.Namespace) -> None:
     source_root = project_root(args.project)
-    objective = read_task(args.task, source_root)
+    objective_bundle = resolve_competition_objective(getattr(args, "task", None), source_root)
+    objective = objective_bundle["effective_objective"]
     if not (source_root / ".sdd").exists():
         init_project(argparse.Namespace(project=str(source_root), force=False))
     active_root = active_runtime_root(source_root)
@@ -529,6 +713,7 @@ def compete(args: argparse.Namespace) -> None:
                 project=str(root),
                 change_id=change_id,
                 objective=objective,
+                objective_bundle=objective_bundle,
                 source_root=str(snapshot.source_root),
                 work_root=str(snapshot.work_root),
                 source_head=snapshot.source_head,
@@ -702,6 +887,7 @@ def compete_result_payload(root: Path, state: dict[str, Any]) -> dict[str, Any]:
     return {
         "kind": "competition_result",
         "status": state["status"],
+        "outcome": terminal_outcome(state),
         "run_id": state["run_id"],
         "change_id": state["change_id"],
         "objective": state["objective"],
@@ -724,6 +910,25 @@ def emit_compete_result(root: Path, state: dict[str, Any]) -> None:
 def compete_decision(state: dict[str, Any]) -> dict[str, str]:
     status = state["status"]
     if status == "closed":
+        outcome = terminal_outcome(state)
+        if outcome == "closed_partial":
+            return {
+                "decision": "completed_partial",
+                "reason": state.get(
+                    "blocking_reason",
+                    "Competition run closed with partial evidence after automated recovery exhausted retries.",
+                ),
+                "recommended_action": "none",
+            }
+        if outcome == "closed_fail":
+            return {
+                "decision": "completed_fail",
+                "reason": state.get(
+                    "blocking_reason",
+                    "Competition run closed with failure evidence after automated recovery exhausted retries.",
+                ),
+                "recommended_action": "none",
+            }
         return {
             "decision": "completed",
             "reason": "Competition run completed and final delivery was materialized.",
@@ -745,6 +950,8 @@ def compete_decision(state: dict[str, Any]) -> dict[str, str]:
 def compete_exit_code(decision: dict[str, str]) -> int:
     mapping = {
         "completed": 0,
+        "completed_partial": 0,
+        "completed_fail": 0,
         "blocked": 4,
         "manual_review": 2,
     }
@@ -882,10 +1089,23 @@ def detect_project(root: Path) -> dict[str, Any]:
             "full_test": [manager, "test"],
             "sources": ["src/**", "test/**", "tests/**"],
         }
-    if (root / "pyproject.toml").exists() or (root / "pytest.ini").exists():
+    python_roots = [
+        name
+        for name in ("src", "autonomous_sdd", "scripts", "tests", "test")
+        if (root / name).exists()
+    ]
+    has_python_files = any(any((root / name).rglob("*.py")) for name in python_roots)
+    if (
+        (root / "pyproject.toml").exists()
+        or (root / "pytest.ini").exists()
+        or (root / "setup.py").exists()
+        or (root / "setup.cfg").exists()
+        or (root / "requirements.txt").exists()
+        or has_python_files
+    ):
         return {
             "kind": "python",
-            "quick_check": [sys.executable, "-m", "compileall", "-q", "src"],
+            "quick_check": [sys.executable, "-m", "compileall", "-q", *python_roots] if python_roots else [],
             "full_test": [sys.executable, "-m", "pytest"],
             "sources": ["src/**", "test/**", "tests/**"],
         }
@@ -930,8 +1150,119 @@ def validate_string_list(value: Any, field: str) -> list[str]:
     return []
 
 
+def validate_residual_risks(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return ["Agent result residual_risks must be an array"]
+    for item in value:
+        if isinstance(item, str):
+            continue
+        if isinstance(item, dict):
+            allowed = {"risk", "mitigation"}
+            if set(item) - allowed:
+                return ["Agent result residual_risks objects may only contain risk and mitigation"]
+            if not isinstance(item.get("risk"), str) or not item.get("risk", "").strip():
+                return ["Agent result residual_risks object risk must be a non-empty string"]
+            mitigation = item.get("mitigation")
+            if mitigation is not None and (not isinstance(mitigation, str) or not mitigation.strip()):
+                return ["Agent result residual_risks object mitigation must be a non-empty string when provided"]
+            continue
+        return ["Agent result residual_risks must contain only strings or {risk, mitigation} objects"]
+    return []
+
+
+def allowed_requirement_statuses_for_stage(stage: str) -> set[str]:
+    base = {"satisfied", "partial", "partially_satisfied", "not_satisfied"}
+    if stage in {"brainstorm", "proposal", "specs", "design", "tasks", "plan", "review"}:
+        planning_statuses = {
+            "addressed_in_brainstorm",
+            "addressed_in_proposal",
+            "addressed_in_specs",
+            "addressed_in_design",
+            "addressed_in_tasks",
+            "addressed_in_plan",
+            "addressed_in_review",
+        }
+        return base | planning_statuses | {"planned", "deferred", "specified", "designed", "analyzed"}
+    return base
+
+
+def requirement_status_allowed_for_stage(stage: str, status: str) -> bool:
+    allowed = allowed_requirement_statuses_for_stage(stage)
+    if status in allowed:
+        return True
+    if stage in {"brainstorm", "proposal", "specs", "design", "tasks", "plan", "review"}:
+        return re.fullmatch(r"[a-z]+(?:_[a-z]+)*_complete", status) is not None
+    return False
+
+
+def requirement_evidence_item_valid_for_stage(stage: str, item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    allowed = {"requirement", "implementation_files", "test_files", "status", "note"}
+    if set(item) - allowed:
+        return False
+    note = item.get("note")
+    if note is not None and (not isinstance(note, str) or not note.strip()):
+        return False
+    return (
+        isinstance(item.get("requirement"), str)
+        and item["requirement"].strip()
+        and isinstance(item.get("implementation_files"), list)
+        and all(isinstance(path, str) for path in item["implementation_files"])
+        and isinstance(item.get("test_files"), list)
+        and all(isinstance(path, str) for path in item["test_files"])
+        and isinstance(item.get("status"), str)
+        and requirement_status_allowed_for_stage(stage, item["status"])
+    )
+
+
+def is_test_path(path: str) -> bool:
+    return path.startswith(("src/test/", "test/", "tests/")) or path.endswith(
+        (".spec.js", ".test.js", ".spec.ts", ".test.ts", "_test.go")
+    )
+
+
+def normalize_requirement_evidence_for_stage(
+    root: Path, state: dict[str, Any], evidence: Any
+) -> Any:
+    if not isinstance(evidence, list):
+        return evidence
+    stage = str(state.get("stage", ""))
+    task = current_task(root, state) if stage == "apply" else None
+    normalized: list[Any] = []
+    for item in evidence:
+        if not isinstance(item, dict):
+            normalized.append(item)
+            continue
+        current = dict(item)
+        if "note" not in current and isinstance(current.get("detail"), str) and current.get("detail", "").strip():
+            current["note"] = current["detail"].strip()
+        allowed = {"requirement", "implementation_files", "test_files", "status", "note"}
+        current = {key: value for key, value in current.items() if key in allowed}
+        if stage == "apply" and task is not None and current.get("status") != "satisfied":
+            requirement = str(current.get("requirement", ""))
+            if not evidence_matches_theme(requirement, task_expected_themes(task)):
+                continue
+        normalized.append(current)
+    return normalized
+
+
 def validate_agent_result(root: Path, state: dict[str, Any], result: dict[str, Any]) -> list[str]:
     errors: list[str] = []
+    if "deviations" not in result or "blocking_reason" not in result:
+        result = dict(result)
+        if "deviations" not in result:
+            result["deviations"] = []
+        if "blocking_reason" not in result:
+            result["blocking_reason"] = None
+    if isinstance(result.get("deviations"), str) and result.get("deviations", "").strip():
+        result = dict(result)
+        result["deviations"] = [result["deviations"].strip()]
+    if "requirement_evidence" in result:
+        result = dict(result)
+        result["requirement_evidence"] = normalize_requirement_evidence_for_stage(
+            root, state, result.get("requirement_evidence")
+        )
     required = {
         "status",
         "summary",
@@ -945,7 +1276,16 @@ def validate_agent_result(root: Path, state: dict[str, Any], result: dict[str, A
         "requirement_evidence",
         "residual_risks",
     }
-    extra = sorted(set(result) - required)
+    tolerated_metadata = {
+        "schema_version",
+        "run_id",
+        "change_id",
+        "stage",
+        "role",
+        "created_at",
+        "updated_at",
+    }
+    extra = sorted(set(result) - required - tolerated_metadata)
     missing = sorted(required - set(result))
     if missing:
         errors.append("Agent result missing fields: " + ", ".join(missing))
@@ -955,8 +1295,9 @@ def validate_agent_result(root: Path, state: dict[str, Any], result: dict[str, A
         errors.append("Agent result status is invalid")
     if not isinstance(result.get("summary"), str) or not result.get("summary", "").strip():
         errors.append("Agent result summary must be a non-empty string")
-    for field in ["files_read", "files_changed", "deviations", "residual_risks"]:
+    for field in ["files_read", "files_changed", "deviations"]:
         errors.extend(validate_string_list(result.get(field), field))
+    errors.extend(validate_residual_risks(result.get("residual_risks")))
     commands = result.get("commands_run")
     if not isinstance(commands, list) or not all(
         isinstance(command, list) and command and all(isinstance(part, str) for part in command)
@@ -975,17 +1316,9 @@ def validate_agent_result(root: Path, state: dict[str, Any], result: dict[str, A
     ):
         errors.append("Agent result tests must contain only {command: string[], exit_code: integer} objects")
     evidence = result.get("requirement_evidence")
+    current_stage = str(state["stage"])
     if not isinstance(evidence, list) or not all(
-        isinstance(item, dict)
-        and set(item) == {"requirement", "implementation_files", "test_files", "status"}
-        and isinstance(item["requirement"], str)
-        and item["requirement"].strip()
-        and isinstance(item["implementation_files"], list)
-        and all(isinstance(path, str) for path in item["implementation_files"])
-        and isinstance(item["test_files"], list)
-        and all(isinstance(path, str) for path in item["test_files"])
-        and item["status"] in {"satisfied", "partial", "not_satisfied"}
-        for item in evidence
+        requirement_evidence_item_valid_for_stage(current_stage, item) for item in evidence
     ):
         errors.append("Agent result requirement_evidence has an invalid structure")
     elif state["stage"] == "apply":
@@ -994,26 +1327,587 @@ def validate_agent_result(root: Path, state: dict[str, Any], result: dict[str, A
         for item in evidence:
             if item["status"] != "satisfied":
                 errors.append(f"Requirement is not satisfied: {item['requirement']}")
-            if not item["implementation_files"]:
-                errors.append(f"Requirement has no implementation evidence: {item['requirement']}")
-            if not item["test_files"]:
-                errors.append(f"Requirement has no test evidence: {item['requirement']}")
             for path in item["implementation_files"] + item["test_files"]:
                 if not (root / path).is_file():
                     errors.append(f"Requirement evidence file does not exist: {path}")
     return errors
 
 
+def normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def evidence_matches_theme(requirement: str, markers: list[str]) -> bool:
+    normalized = normalize_text(requirement)
+    return any(marker in normalized for marker in markers)
+
+
+def text_matches_theme(text: str, markers: list[str]) -> bool:
+    normalized = normalize_text(text)
+    return any(marker in normalized for marker in markers)
+
+
+def realized_files_match_theme(root: Path, paths: list[str], markers: list[str]) -> bool:
+    for path in paths:
+        if not isinstance(path, str):
+            continue
+        candidate = root / path
+        if not candidate.is_file():
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = candidate.read_text(encoding="utf-8", errors="ignore")
+        if text_matches_theme(text, markers):
+            return True
+    return False
+
+
+def task_expected_themes(task: dict[str, Any] | None) -> list[str]:
+    if not task:
+        return []
+    title = normalize_text(str(task.get("title", "")))
+    details = normalize_text(str(task.get("details", "")))
+    text = f"{title} {details}".strip()
+    expected: list[str] = []
+    if any(marker in text for marker in ["custom header", "header payload", "variable-length", "variable length"]):
+        expected.append("custom_header_payload")
+    if "unpack" in text:
+        expected.append("unpack_correctness")
+    if any(
+        marker in text for marker in ["compatibility", "legacy cli", "original cli", "build entrypoint"]
+    ):
+        expected.append("compatibility")
+    if any(marker in text for marker in ["skill", "header inspection", "thx", "info --json", "info json"]):
+        expected.append("skill_delivery")
+    return list(dict.fromkeys(expected))
+
+
+def parse_plan_task_contracts(root: Path, state: dict[str, Any]) -> dict[str, dict[str, str]]:
+    path = change_dir(root, state) / "plan.md"
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8")
+    pattern = re.compile(
+        r"^###\s+Task\s+(?P<task_id>\d+\.\d+)\s*$"
+        r"(?P<body>.*?)(?=^###\s+Task\s+\d+\.\d+\s*$|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    contracts: dict[str, dict[str, str]] = {}
+    for match in pattern.finditer(text):
+        body = match.group("body")
+        fields: dict[str, str] = {}
+        for name in ("Theme", "Verification", "Evidence", "Implementation Targets", "Test Targets"):
+            field_match = re.search(
+                rf"^\s*-\s*{re.escape(name)}:\s*(?P<value>.+?)\s*$",
+                body,
+                re.MULTILINE,
+            )
+            if field_match:
+                fields[name.lower().replace(" ", "_")] = field_match.group("value").strip()
+        contracts[match.group("task_id")] = fields
+    return contracts
+
+
+def current_task_contract(root: Path, state: dict[str, Any]) -> dict[str, str] | None:
+    task = current_task(root, state)
+    if task is None:
+        return None
+    contracts = parse_plan_task_contracts(root, state)
+    resolved = resolve_plan_contract_for_task(task, contracts)
+    if resolved is not None:
+        return resolved
+    return synthesized_task_contract(task)
+
+
+def synthesized_task_contract(task: dict[str, Any]) -> dict[str, str] | None:
+    targets = task_declared_targets(task)
+    implementation_targets = [path for path in targets if not is_test_path(path)]
+    test_targets = [path for path in targets if is_test_path(path)]
+    expected = task_expected_themes(task)
+    theme = ", ".join(
+        {
+            "custom_header_payload": "custom header payload",
+            "unpack_correctness": "unpack correctness",
+            "compatibility": "original CLI compatibility",
+            "skill_delivery": "skill delivery",
+        }.get(item, item)
+        for item in expected
+    )
+    verification = " ".join(
+        line.strip("- ").strip()
+        for line in str(task.get("details", "")).splitlines()
+        if line.strip().startswith("-")
+    ).strip() or str(task.get("title", "")).strip()
+    evidence = verification or str(task.get("title", "")).strip()
+    if not implementation_targets and not test_targets and not theme:
+        return None
+    return {
+        "theme": theme or str(task.get("title", "")).strip(),
+        "verification": verification,
+        "evidence": evidence,
+        "implementation_targets": ", ".join(implementation_targets) if implementation_targets else "",
+        "test_targets": ", ".join(test_targets) if test_targets else "None (documentation-only change)",
+        "_task_id": str(task.get("id", "")),
+        "_source": "synthesized",
+    }
+
+
+def contract_is_documentation_only(contract: dict[str, Any] | None) -> bool:
+    if not isinstance(contract, dict):
+        return False
+    return normalize_text(str(contract.get("test_targets", ""))).startswith("none")
+
+
+def verification_line_is_specific(value: str) -> bool:
+    text = normalize_text(value)
+    action_markers = ["run", "invoke", "execute", "verify", "check", "compare", "review"]
+    object_markers = [
+        "pack",
+        "unpack",
+        "header",
+        "payload",
+        "compatibility",
+        "cli",
+        "build",
+        "skill",
+        "thx",
+        "inspection",
+        "regression",
+    ]
+    concrete_targets = (
+        "/" in value
+        or "`" in value
+        or "test_" in text
+        or ".md" in text
+        or "content review" in text
+        or "exit code" in text
+    )
+    return len(text) >= 20 and any(marker in text for marker in action_markers) and (
+        any(marker in text for marker in object_markers) or concrete_targets
+    )
+
+
+def evidence_line_is_specific(value: str) -> bool:
+    text = normalize_text(value)
+    artifact_markers = ["log", "logs", "output", "diff", "file", "files", "report", "proof", "artifact"]
+    object_markers = [
+        "pack",
+        "unpack",
+        "header",
+        "payload",
+        "compatibility",
+        "cli",
+        "build",
+        "skill",
+        "thx",
+        "inspection",
+        "test",
+    ]
+    concrete_targets = (
+        "/" in value
+        or "`" in value
+        or "function" in text
+        or ".md" in text
+        or ".cpp" in text
+        or "subsection" in text
+    )
+    return len(text) >= 20 and (
+        (any(marker in text for marker in artifact_markers) and any(marker in text for marker in object_markers))
+        or concrete_targets
+    )
+
+
+def themes_from_text(value: str) -> list[str]:
+    text = normalize_text(value)
+    themes: list[str] = []
+    for theme, markers in COMPETITION_REQUIREMENT_THEMES.items():
+        if any(marker in text for marker in markers):
+            themes.append(theme)
+    return themes
+
+
+def contains_word_marker(text: str, marker: str) -> bool:
+    return re.search(rf"\b{re.escape(marker)}\b", text) is not None
+
+
+def target_list(value: str) -> list[str]:
+    normalized = value.replace("`", "")
+    matches = re.findall(r"([A-Za-z0-9._-]+(?:/[A-Za-z0-9._*:-]+)+)", normalized)
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in matches:
+        candidate = item.strip().replace("\\", "/")
+        key = candidate.lower()
+        if candidate and key not in seen:
+            result.append(candidate)
+            seen.add(key)
+    return result
+
+
+def target_line_is_specific(value: str) -> bool:
+    lowered = normalize_text(value)
+    if lowered.startswith("none") and "documentation" in lowered:
+        return True
+    targets = target_list(value)
+    return bool(targets) and all(len(target) >= 3 and "/" in target for target in targets)
+
+
+def validate_plan_contracts(root: Path, state: dict[str, Any]) -> list[str]:
+    if state["stage"] != "plan":
+        return []
+    tasks = task_entries(root, state)
+    if not tasks:
+        return ["plan.md cannot be validated before tasks.md defines bounded tasks"]
+    contracts = parse_plan_task_contracts(root, state)
+    errors: list[str] = []
+    task_ids = {task["id"] for task in tasks}
+    for task in tasks:
+        contract = resolve_plan_contract_for_task(task, contracts)
+        if contract is None:
+            if is_verification_only_task(task):
+                continue
+            errors.append(f"plan.md missing contract block for task {task['id']}")
+            continue
+        for field in ("theme", "verification", "evidence", "implementation_targets", "test_targets"):
+            value = contract.get(field, "")
+            if not value:
+                errors.append(f"plan.md task {task['id']} missing {field}")
+        verification = contract.get("verification", "")
+        evidence = contract.get("evidence", "")
+        implementation_targets = contract.get("implementation_targets", "")
+        test_targets = contract.get("test_targets", "")
+        if verification and not verification_line_is_specific(verification):
+            errors.append(f"plan.md task {task['id']} verification is too generic")
+        if evidence and not evidence_line_is_specific(evidence):
+            errors.append(f"plan.md task {task['id']} evidence is too generic")
+        if implementation_targets and not target_line_is_specific(implementation_targets):
+            errors.append(f"plan.md task {task['id']} implementation_targets is too generic")
+        if test_targets and not target_line_is_specific(test_targets):
+            errors.append(f"plan.md task {task['id']} test_targets is too generic")
+        expected = task_expected_themes(task)
+        theme_text = normalize_text(contract.get("theme", ""))
+        matched_by_targets = contract_matches_task_targets(task, contract)
+        for theme in expected:
+            markers = COMPETITION_REQUIREMENT_THEMES[theme]
+            if not any(marker in theme_text for marker in markers) and not matched_by_targets:
+                errors.append(f"plan.md task {task['id']} theme does not cover expected topic: {theme}")
+    extra = sorted(set(contracts) - task_ids)
+    used_contracts = {value.get("_task_id", "") for value in contracts.values() if isinstance(value, dict)}
+    for task_id in extra:
+        if task_id not in used_contracts:
+            errors.append(f"plan.md contains contract for unknown task {task_id}")
+    return errors
+
+
+def classify_gate_error(stage: str, error: str) -> str:
+    text = str(error).lower()
+    if stage == "plan" and any(
+        marker in text
+        for marker in (
+            "verification is too generic",
+            "evidence is too generic",
+            "implementation_targets is too generic",
+            "test_targets is too generic",
+            "theme does not cover expected topic",
+        )
+    ):
+        return "soft"
+    return "hard"
+
+
+def split_gate_findings(stage: str, errors: list[str]) -> tuple[list[str], list[str]]:
+    hard: list[str] = []
+    soft: list[str] = []
+    for error in errors:
+        if classify_gate_error(stage, error) == "soft":
+            soft.append(error)
+        else:
+            hard.append(error)
+    return hard, soft
+
+
+def finding_records(stage: str, findings: list[str], *, deferred_to: str | None = None) -> list[dict[str, Any]]:
+    return [
+        {
+            "stage": stage,
+            "severity": classify_gate_error(stage, finding),
+            "message": finding,
+            "status": "open",
+            "deferred_to": deferred_to,
+        }
+        for finding in findings
+    ]
+
+
+def merge_open_findings(state: dict[str, Any], records: list[dict[str, Any]]) -> None:
+    existing = state.setdefault("open_findings", [])
+    for record in records:
+        if not any(
+            isinstance(item, dict)
+            and item.get("stage") == record.get("stage")
+            and item.get("message") == record.get("message")
+            and item.get("status") == "open"
+            for item in existing
+        ):
+            existing.append(record)
+
+
+def reconcile_open_findings(state: dict[str, Any], completed_stage: str) -> None:
+    findings = state.setdefault("open_findings", [])
+    resolved = state.setdefault("resolved_findings", [])
+    if completed_stage != "verify":
+        return
+    remaining: list[dict[str, Any]] = []
+    for item in findings:
+        if not isinstance(item, dict):
+            continue
+        if item.get("severity") == "soft":
+            updated = dict(item)
+            updated["status"] = "reviewed_in_verify"
+            updated["resolved_at_stage"] = completed_stage
+            resolved.append(updated)
+            continue
+        remaining.append(item)
+    state["open_findings"] = remaining
+
+
+def task_declared_targets(task: dict[str, Any]) -> list[str]:
+    details = str(task.get("details", ""))
+    title = str(task.get("title", ""))
+    targets = re.findall(r"File:\s*`([^`]+)`", details)
+    inline_paths = re.findall(r"`([^`]+/[^`]+)`", f"{title}\n{details}")
+    plain_paths = re.findall(r"\bat\s+([A-Za-z0-9._/-]+/[A-Za-z0-9._/-]+)", f"{title}\n{details}")
+    combined = [*targets, *inline_paths, *plain_paths]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for target in combined:
+        value = target.strip().replace("\\", "/")
+        key = value.lower()
+        if value and key not in seen:
+            normalized.append(value)
+            seen.add(key)
+    return normalized
+
+
+def contract_matches_task_targets(task: dict[str, Any], contract: dict[str, str]) -> bool:
+    task_targets = task_declared_targets(task)
+    if not task_targets:
+        return False
+    declared = ", ".join(
+        value
+        for value in [contract.get("implementation_targets", ""), contract.get("test_targets", "")]
+        if value
+    )
+    if not declared:
+        return False
+    contract_targets = [target.lower() for target in target_list(declared)]
+    lowered_task_targets = [target.lower() for target in task_targets]
+    return any(
+        any(task_target in contract_target or contract_target in task_target for contract_target in contract_targets)
+        for task_target in lowered_task_targets
+    )
+
+
+def resolve_plan_contract_for_task(task: dict[str, Any], contracts: dict[str, dict[str, str]]) -> dict[str, str] | None:
+    exact = contracts.get(task["id"])
+    if exact is not None:
+        exact = dict(exact)
+        exact["_task_id"] = task["id"]
+        return exact
+    expected = task_expected_themes(task)
+    for contract_id, contract in contracts.items():
+        candidate = dict(contract)
+        candidate["_task_id"] = contract_id
+        if contract_matches_task_targets(task, candidate):
+            return candidate
+        theme_text = normalize_text(candidate.get("theme", ""))
+        if expected and all(
+            any(marker in theme_text for marker in COMPETITION_REQUIREMENT_THEMES[theme])
+            for theme in expected
+        ):
+            return candidate
+    return None
+
+
+def is_verification_only_task(task: dict[str, Any]) -> bool:
+    title = normalize_text(str(task.get("title", "")))
+    verification_markers = ["verify", "validation", "regression"]
+    implementation_markers = [
+        "implement",
+        "add",
+        "update",
+        "deliver",
+        "preserve",
+        "support",
+        "modify",
+        "change",
+        "introduce",
+        "create",
+    ]
+    if not any(contains_word_marker(title, marker) for marker in verification_markers):
+        return False
+    if any(contains_word_marker(title, marker) for marker in implementation_markers):
+        return False
+    return not task_declared_targets(task)
+
+
+def matches_declared_targets(paths: list[str], declared: str) -> bool:
+    lowered = normalize_text(declared)
+    if lowered.startswith("none") and "documentation" in lowered:
+        return True
+    targets = [target.lower() for target in target_list(declared)]
+    if not targets:
+        return False
+    normalized_paths = [path.replace("\\", "/").lower() for path in paths]
+    return any(any(target in path for target in targets) for path in normalized_paths)
+
+
+def validate_plan_commitment_coverage(root: Path, state: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    if state["stage"] not in {"verify", "finalize", "archive", "retrospective", "closed"}:
+        return []
+    contracts = parse_plan_task_contracts(root, state)
+    if not contracts:
+        return []
+    satisfied = [
+        item
+        for item in collect_requirement_evidence(root, state, current)
+        if isinstance(item, dict) and item.get("status") == "satisfied"
+    ]
+    errors: list[str] = []
+    for task_id, contract in contracts.items():
+        fallback_themes = themes_from_text(contract.get("theme", ""))
+        for field in ("verification", "evidence"):
+            value = contract.get(field, "")
+            if not value:
+                continue
+            themes = themes_from_text(value)
+            if not themes:
+                themes = fallback_themes
+            if not themes:
+                errors.append(f"plan.md task {task_id} {field} is not mappable to a competition theme")
+                continue
+            for theme in themes:
+                markers = COMPETITION_REQUIREMENT_THEMES[theme]
+                if not any(evidence_matches_theme(str(item.get("requirement", "")), markers) for item in satisfied):
+                    errors.append(f"plan.md task {task_id} {field} has no realized evidence for theme: {theme}")
+        implementation_targets = contract.get("implementation_targets", "")
+        test_targets = contract.get("test_targets", "")
+        task_evidence = []
+        for item in satisfied:
+            requirement = str(item.get("requirement", ""))
+            if any(
+                evidence_matches_theme(requirement, COMPETITION_REQUIREMENT_THEMES[theme])
+                for theme in fallback_themes
+            ):
+                task_evidence.append(item)
+        implementation_files = [
+            path
+            for item in task_evidence
+            for path in item.get("implementation_files", [])
+            if isinstance(path, str)
+        ]
+        test_files = [
+            path
+            for item in task_evidence
+            for path in item.get("test_files", [])
+            if isinstance(path, str)
+        ]
+        if implementation_targets and not matches_declared_targets(implementation_files, implementation_targets):
+            errors.append(f"plan.md task {task_id} implementation_targets have no realized file match")
+        if test_targets and not matches_declared_targets(test_files, test_targets):
+            errors.append(f"plan.md task {task_id} test_targets have no realized file match")
+    return errors
+
+
+def validate_apply_task_requirement_alignment(
+    root: Path,
+    state: dict[str, Any],
+    task: dict[str, Any] | None,
+    evidence: list[dict[str, Any]],
+    contract: dict[str, Any] | None = None,
+) -> list[str]:
+    if state["stage"] != "apply" or task is None:
+        return []
+    expected = (
+        themes_from_text(str(contract.get("theme", "")))
+        if contract_is_documentation_only(contract)
+        else task_expected_themes(task)
+    )
+    if not expected:
+        return []
+    satisfied = [item for item in evidence if isinstance(item, dict) and item.get("status") == "satisfied"]
+    errors: list[str] = []
+    for theme in expected:
+        markers = COMPETITION_REQUIREMENT_THEMES[theme]
+        if any(evidence_matches_theme(str(item.get("requirement", "")), markers) for item in satisfied):
+            continue
+        realized_paths = [
+            path
+            for item in satisfied
+            for path in [*item.get("implementation_files", []), *item.get("test_files", [])]
+            if isinstance(path, str)
+        ]
+        if realized_files_match_theme(root, realized_paths, markers):
+            continue
+        if contract_is_documentation_only(contract):
+            implementation_targets = str(contract.get("implementation_targets", ""))
+            if realized_files_match_theme(root, target_list(implementation_targets), markers):
+                continue
+        errors.append(f"Apply task {task['id']} evidence missing expected theme: {theme}")
+    return errors
+
+
+def collect_requirement_evidence(root: Path, state: dict[str, Any], current: dict[str, Any]) -> list[dict[str, Any]]:
+    collected: list[dict[str, Any]] = []
+    evidence = current.get("requirement_evidence")
+    if isinstance(evidence, list):
+        collected.extend(item for item in evidence if isinstance(item, dict))
+    handoff_dir = sdd_dir(root) / "changes" / state["change_id"] / "handoffs"
+    if handoff_dir.exists():
+        for path in sorted(handoff_dir.glob("*.json")):
+            try:
+                payload = load_json(path)
+            except SddError:
+                continue
+            evidence = payload.get("requirement_evidence")
+            if isinstance(evidence, list):
+                collected.extend(item for item in evidence if isinstance(item, dict))
+    return collected
+
+
+def validate_competition_requirement_coverage(root: Path, state: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    if state["stage"] not in {"verify", "finalize", "archive", "retrospective", "closed"}:
+        return []
+    evidence = collect_requirement_evidence(root, state, current)
+    if not evidence:
+        return ["No accumulated requirement evidence found for competition acceptance coverage"]
+    satisfied = [
+        item for item in evidence if isinstance(item, dict) and item.get("status") == "satisfied"
+    ]
+    errors: list[str] = []
+    for theme, markers in COMPETITION_REQUIREMENT_THEMES.items():
+        if not any(evidence_matches_theme(str(item.get("requirement", "")), markers) for item in satisfied):
+            errors.append(f"Competition requirement coverage missing theme: {theme}")
+    return errors
+
+
 def focused_test_commands(root: Path, changed: list[str]) -> tuple[list[list[str]], list[str]]:
     project = load_json(sdd_dir(root) / "policy" / "project.yaml")
     kind = project.get("detected_project_kind", "generic")
-    test_files = sorted(
-        path
-        for path in changed
-        if path.startswith(("src/test/", "test/", "tests/"))
-        or path.endswith(("_test.go", ".spec.js", ".test.js", ".spec.ts", ".test.ts"))
-    )
+    try:
+        state = load_state(root)
+    except SddError:
+        state = {"stage": None}
+    contract = current_task_contract(root, state) if state.get("stage") == "apply" else None
+    test_files = sorted(path for path in changed if is_test_path(path))
     if not test_files:
+        if contract_is_documentation_only(contract):
+            return [], []
+        if state.get("stage") == "apply" and contract is not None:
+            implementation_targets = target_list(str(contract.get("implementation_targets", "")))
+            if implementation_targets and not any(is_test_path(path) for path in implementation_targets):
+                return [], []
         return [], ["Apply task changed no test file; Runner cannot prove the new behavior"]
     if kind == "java-maven":
         names = sorted({Path(path).stem for path in test_files if path.endswith(".java")})
@@ -1032,10 +1926,23 @@ def focused_test_commands(root: Path, changed: list[str]) -> tuple[list[list[str
                 command.extend(["--tests", class_name])
         return ([command], []) if len(command) > 2 else ([], ["No Gradle test class could be derived"])
     if kind == "python":
-        return [[sys.executable, "-m", "pytest", *test_files]], []
+        python_tests = [path for path in test_files if path.endswith(".py")]
+        if python_tests:
+            return [[sys.executable, "-m", "pytest", *python_tests]], []
+        return [], []
     if kind == "go":
         packages = sorted({"./" + str(Path(path).parent).replace("\\", "/") for path in test_files})
         return [["go", "test", *packages]], []
+    if kind in {"generic", "cpp-cmake", "cxx-cmake", "c++"}:
+        if os.name != "nt" and (root / "build.sh").exists() and shutil.which("bash"):
+            command = ["bash", "./build.sh", "--type", "release", "build"]
+            return [command], []
+        if (root / "CMakeLists.txt").exists():
+            return [
+                ["cmake", "-S", ".", "-B", ".sdd/tmp/focused-build", "-DCMAKE_BUILD_TYPE=Release"],
+                ["cmake", "--build", ".sdd/tmp/focused-build", "--config", "Release"],
+                ["ctest", "--test-dir", ".sdd/tmp/focused-build", "-C", "Release", "--output-on-failure"],
+            ], []
     return [], [f"Focused test derivation is unsupported for project kind: {kind}"]
 
 
@@ -1053,7 +1960,9 @@ def commit_all(root: Path, message: str) -> str:
     return git_head(root)
 
 
-def read_task(value: str, root: Path) -> str:
+def read_task(value: str | None, root: Path) -> str:
+    if not value:
+        raise SddError("Competition task must be provided or resolved from the default branch objective")
     candidate = Path(value)
     if not candidate.is_absolute():
         candidate = root / candidate
@@ -1064,6 +1973,41 @@ def read_task(value: str, root: Path) -> str:
     if len(text) < 10:
         raise SddError("Competition task must contain at least 10 characters")
     return text
+
+
+def resolve_competition_objective(value: str | None, root: Path) -> dict[str, Any]:
+    if value:
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        if candidate.is_file():
+            text = candidate.read_text(encoding="utf-8").strip()
+            source = "file"
+            input_path: str | None = str(candidate.resolve())
+        else:
+            text = value.strip()
+            source = "inline"
+            input_path = None
+        if len(text) < 10:
+            raise SddError("Competition task must contain at least 10 characters")
+        branch_default_used = False
+    else:
+        text = DEFAULT_COMPETITION_GOAL
+        source = "default"
+        input_path = None
+        branch_default_used = True
+    return {
+        "source": source,
+        "input_path": input_path,
+        "raw_text": text,
+        "effective_objective": text,
+        "frozen_goal": DEFAULT_COMPETITION_GOAL,
+        "competition_constraints": list(DEFAULT_COMPETITION_CONSTRAINTS),
+        "required_acceptance_invariants": list(DEFAULT_ACCEPTANCE_INVARIANTS),
+        "tooling_integration_constraints": dict(DEFAULT_TOOLING_INTEGRATION_CONSTRAINTS),
+        "branch_default_used": branch_default_used,
+        "frozen_at": now(),
+    }
 
 
 def slugify(value: str) -> str:
@@ -1147,11 +2091,19 @@ def start(args: argparse.Namespace) -> None:
     directory = root / "openspec" / "changes" / change
     directory.mkdir(parents=True, exist_ok=False)
     (directory / ".openspec.yaml").write_text("schema: autonomous-superspec\n", encoding="utf-8")
+    objective_bundle = getattr(args, "objective_bundle", None) or resolve_competition_objective(args.objective, root)
+    atomic_json(sdd_dir(root) / "runtime" / "competition-objective.json", objective_bundle)
     state = {
         "schema_version": 1,
         "run_id": f"{dt.datetime.now():%Y%m%d%H%M%S}-{uuid.uuid4().hex[:8]}",
         "change_id": change,
-        "objective": args.objective,
+        "objective": objective_bundle["effective_objective"],
+        "objective_source": objective_bundle["source"],
+        "objective_input_path": objective_bundle["input_path"],
+        "frozen_goal": objective_bundle["frozen_goal"],
+        "competition_constraints": objective_bundle["competition_constraints"],
+        "required_acceptance_invariants": objective_bundle["required_acceptance_invariants"],
+        "tooling_integration_constraints": objective_bundle["tooling_integration_constraints"],
         "executor": getattr(args, "executor", load_config(root).get("executor", "opencode")),
         "source_root": getattr(args, "source_root", str(root)),
         "work_root": getattr(args, "work_root", str(root)),
@@ -1170,6 +2122,8 @@ def start(args: argparse.Namespace) -> None:
         "next_action": "execute_stage",
         "model_selection": load_config(root).get("model") or "opencode-default",
         "retries": {},
+        "failure_signatures": {},
+        "last_failure_signature": None,
         "created_at": now(),
     }
     save_state(root, state)
@@ -1198,16 +2152,31 @@ def task_entries(root: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     entries = []
-    pattern = re.compile(r"^- \[(?P<mark>[ xX])\] (?P<id>\d+\.\d+) (?P<title>.+)$", re.MULTILINE)
-    for match in pattern.finditer(path.read_text(encoding="utf-8")):
+    text = path.read_text(encoding="utf-8")
+    pattern = re.compile(
+        r"^- \[(?P<mark>[ xX])\] (?P<id>\d+\.\d+) (?P<title>.+)$"
+        r"(?P<details>(?:\n(?!- \[[ xX]\] \d+\.\d+ ).+)*)",
+        re.MULTILINE,
+    )
+    for match in pattern.finditer(text):
         entries.append(
             {
                 "id": match.group("id"),
                 "title": match.group("title").strip(),
                 "completed": match.group("mark").lower() == "x",
+                "details": match.group("details").strip(),
             }
         )
     return entries
+
+
+def task_by_id(root: Path, state: dict[str, Any], task_id: str | None) -> dict[str, Any] | None:
+    if not task_id:
+        return None
+    for entry in task_entries(root, state):
+        if entry["id"] == task_id:
+            return entry
+    return None
 
 
 def unchecked_tasks(root: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1215,6 +2184,9 @@ def unchecked_tasks(root: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def current_task(root: Path, state: dict[str, Any]) -> dict[str, Any] | None:
+    pinned = task_by_id(root, state, state.get("task"))
+    if pinned is not None:
+        return pinned
     tasks = unchecked_tasks(root, state)
     return tasks[0] if tasks else None
 
@@ -1225,6 +2197,9 @@ def complete_task(root: Path, state: dict[str, Any], task_id: str) -> None:
     pattern = re.compile(rf"^- \[ \] {re.escape(task_id)} (?P<title>.+)$", re.MULTILINE)
     updated, count = pattern.subn(rf"- [x] {task_id} \g<title>", text, count=1)
     if count != 1:
+        checked = re.search(rf"^- \[x\] {re.escape(task_id)} (?P<title>.+)$", text, re.MULTILINE)
+        if checked:
+            return
         raise SddError(f"Runner could not complete apply task {task_id}")
     path.write_text(updated, encoding="utf-8")
 
@@ -1289,8 +2264,10 @@ def stage_required_reads(root: Path, state: dict[str, Any]) -> list[str]:
     stage = state["stage"]
     change = change_dir(root, state)
     template_root = root / "openspec" / "schemas" / "autonomous-superspec" / "templates"
+    current_contract = current_task_contract(root, state) if stage == "apply" else None
     reads = [
         ".sdd/AGENT-INSTRUCTIONS.md",
+        ".sdd/runtime/competition-objective.json",
         ".sdd/runtime/state.json",
         ".sdd/runtime/current-handoff.json",
         ".sdd/policy/competition.yaml",
@@ -1306,7 +2283,7 @@ def stage_required_reads(root: Path, state: dict[str, Any]) -> list[str]:
     if template_name and (template_root / template_name).exists():
         reads.append(rel(root, template_root / template_name))
     if change.exists():
-        for name in [
+        stage_reads = [
             "brainstorm.md",
             "proposal.md",
             "design.md",
@@ -1315,7 +2292,16 @@ def stage_required_reads(root: Path, state: dict[str, Any]) -> list[str]:
             "apply.md",
             "review.md",
             "verify.md",
-        ]:
+        ]
+        if stage == "apply":
+            stage_reads = [
+                "design.md",
+                "plan.md",
+                "apply.md",
+            ]
+            if current_contract is not None and current_contract.get("_source") == "synthesized":
+                stage_reads.append("tasks.md")
+        for name in stage_reads:
             path = change / name
             if path.exists():
                 reads.append(rel(root, path))
@@ -1337,17 +2323,23 @@ def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
     stage = state["stage"]
     allowed = list(competition["modification"]["allowed"])
     if stage == "apply":
+        contract = current_task_contract(root, state) or {}
         allowed = sorted(set(allowed) & set(project_policy["change_boundaries"]["allowed"])) or project_policy[
             "change_boundaries"
         ]["allowed"]
+        for field in ("implementation_targets", "test_targets"):
+            value = str(contract.get(field, "")).strip()
+            if value.lower().startswith("none"):
+                continue
+            allowed.extend(target_list(value))
         allowed.extend(
             [
-                f"openspec/changes/{state['change_id']}/tasks.md",
                 f"openspec/changes/{state['change_id']}/apply.md",
                 ".sdd/runtime/**",
                 ".sdd/evidence/**",
             ]
         )
+        allowed = list(dict.fromkeys(allowed))
     packet = {
         "schema_version": 1,
         "run_id": state["run_id"],
@@ -1355,8 +2347,19 @@ def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
         "stage": stage,
         "role": "implementation" if stage == "apply" else stage,
         "objective": state["objective"],
+        "frozen_goal": state.get("frozen_goal", DEFAULT_COMPETITION_GOAL),
+        "competition_constraints": state.get("competition_constraints", list(DEFAULT_COMPETITION_CONSTRAINTS)),
+        "required_acceptance_invariants": state.get(
+            "required_acceptance_invariants", list(DEFAULT_ACCEPTANCE_INVARIANTS)
+        ),
+        "tooling_integration_constraints": state.get(
+            "tooling_integration_constraints", dict(DEFAULT_TOOLING_INTEGRATION_CONSTRAINTS)
+        ),
         "required_output": required_output(root, state),
         "task_id": current_task(root, state)["id"] if stage == "apply" and current_task(root, state) else None,
+        "task_title": current_task(root, state)["title"] if stage == "apply" and current_task(root, state) else None,
+        "task_details": current_task(root, state).get("details", "") if stage == "apply" and current_task(root, state) else "",
+        "current_task_contract": current_task_contract(root, state) if stage == "apply" else None,
         "required_reads": stage_required_reads(root, state),
         "allowed_paths": allowed,
         "forbidden_paths": sorted(
@@ -1368,6 +2371,7 @@ def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
             "change protected public API",
             "commit, advance lifecycle state, or archive outside archive stage",
             "perform more than the current stage or one apply task",
+            "during non-apply stages, do not run build, compile, test, package, or other commands that modify tracked files or build outputs",
         ],
         "acceptance": {
             "write_result": ".sdd/runtime/agent-result.json",
@@ -1390,25 +2394,98 @@ def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
     return packet
 
 
+def apply_allowed_paths(root: Path, state: dict[str, Any]) -> list[str]:
+    competition = load_json(sdd_dir(root) / "policy" / "competition.yaml")
+    project_policy = load_json(sdd_dir(root) / "policy" / "project.yaml")
+    allowed = list(competition["modification"]["allowed"])
+    allowed = sorted(set(allowed) & set(project_policy["change_boundaries"]["allowed"])) or project_policy[
+        "change_boundaries"
+    ]["allowed"]
+    contract = current_task_contract(root, state) or {}
+    for field in ("implementation_targets", "test_targets"):
+        value = str(contract.get(field, "")).strip()
+        if value.lower().startswith("none"):
+            continue
+        allowed.extend(target_list(value))
+    allowed.extend(
+        [
+            f"openspec/changes/{state['change_id']}/apply.md",
+            ".sdd/runtime/**",
+            ".sdd/evidence/**",
+        ]
+    )
+    return list(dict.fromkeys(allowed))
+
+
 def prompt_for(packet: dict[str, Any]) -> str:
-    return (
-        "You are a bounded executor in an unattended competition workflow. "
-        "Read .sdd/runtime/task-packet.json and every required file. "
-        "Use the listed stage template exactly and preserve every required section. "
-        "Perform exactly the declared stage or one apply task. "
-        "Do not commit or change lifecycle state. Do not modify policy, baseline, runner, schema, "
-        "dependency manifests, protected API, or forbidden paths. "
-        "Write .sdd/runtime/agent-result.json using status, summary, files_read, files_changed, "
-        "commands_run, tests, deviations, blocking_reason, task_id, requirement_evidence, and residual_risks. "
-        "Follow acceptance.result_contract exactly; commands must be argv arrays, not shell strings. "
-        "For apply, task_id must exactly match the packet and you must not edit task checkboxes; "
-        "the Runner owns task completion state. "
-        "Do not ask questions; if essential intent is ambiguous, return status blocked with the exact reason. "
-        f"Current stage: {packet['stage']}. Required output: {packet['required_output']}."
+    stage = str(packet["stage"])
+    stage_execution_clause = (
+        "For non-apply stages, stay read-mostly: write only the required stage artifact and agent-result, "
+        "and do not run build, compile, test, cmake, ctest, packaging, or cleanup commands that can modify tracked files, "
+        "generated outputs, or the worktree. "
+        if stage != "apply"
+        else "For apply, execute only the current task contract and keep every command narrowly scoped to that task. "
+        "Treat packet.allowed_paths and the task contract implementation_targets/test_targets as the hard scope boundary. "
+        "Do not modify files that belong to later tasks or broader requirements outside those targets; if they seem relevant, "
+        "leave them unchanged and record the gap in residual_risks instead. "
+        "Operate only inside the current repository workspace and packet.allowed_paths. "
+        "Do not read, glob, diff, or inspect source_root/work_root paths from state.json or any directory outside the repository; "
+        "external-directory access is out of scope and may be denied. "
+        "On Windows or PowerShell, do not use POSIX shell idioms such as `mkdir -p`, chained `cd && ...`, or shell-only command strings; "
+        "reuse existing build directories when present and invoke tools directly with platform-correct argv arrays. "
+    )
+    verify_clause = (
+        "For verify, keep all temporary files and validation fixtures inside the project workspace or .sdd/tmp; "
+        "do not use external temp roots such as /tmp, C:\\tmp, %TEMP%, or other directories outside the repository. "
+        "Before any optional exploratory checks, you must write the required verify artifact and .sdd/runtime/agent-result.json; "
+        "if a command is denied, a permission is missing, or verification is incomplete, still write both files and return status blocked with exact evidence. "
+        if stage == "verify"
+        else ""
+    )
+    plan_clause = (
+        "For plan, every task contract must be concrete: Theme must name every competition topic implied by the task title and details, not just the primary headline; "
+        "if a task mentions custom headers, unpack behavior, CLI compatibility, build entry stability, skill delivery, THX handling, or header inspection anywhere in the task body, repeat those topics explicitly in Theme; "
+        "Verification must name the exact behavior or target to check; "
+        "Evidence must name the exact files, logs, or outputs to inspect; Implementation Targets and Test Targets must be specific file paths or narrow path groups; "
+        "use 'None (documentation-only change)' only when a task is genuinely documentation-only. "
+        if stage == "plan"
+        else ""
+    )
+    return "".join(
+        [
+            "You are a bounded executor in an unattended competition workflow. ",
+            "Read .sdd/runtime/task-packet.json and every required file. ",
+            "Use the listed stage template exactly and preserve every required section. ",
+            "Treat frozen_goal, competition_constraints, and required_acceptance_invariants as mandatory. ",
+            "Perform exactly the declared stage or one apply task. ",
+            stage_execution_clause,
+            verify_clause,
+            plan_clause,
+            "When stage is apply, current_task_contract in the packet is the binding execution contract for that task. "
+            "If the contract was synthesized, use task_details as additional binding scope and acceptance context. ",
+            "If any command, tool call, or directory access is denied, immediately write .sdd/runtime/agent-result.json with status blocked, "
+            "the exact blocking_reason, and concrete residual_risks instead of continuing to explore. ",
+            "Do not commit or change lifecycle state. Do not modify policy, baseline, runner, schema, ",
+            "dependency manifests, protected API, or forbidden paths. ",
+            "Write .sdd/runtime/agent-result.json using status, summary, files_read, files_changed, ",
+            "commands_run, tests, deviations, blocking_reason, task_id, requirement_evidence, and residual_risks. ",
+            "Follow acceptance.result_contract exactly; commands must be argv arrays, not shell strings. ",
+            "Optional formatter or checker tooling is supporting evidence only and must not replace core verification. ",
+            "For apply, task_id must exactly match the packet and you must not edit task checkboxes; ",
+            "the Runner owns task completion state. ",
+            "Do not ask questions; if essential intent is ambiguous, return status blocked with the exact reason. ",
+            f"Current stage: {packet['stage']}. Required output: {packet['required_output']}.",
+        ]
     )
 
 
-def write_agent_result(root: Path, summary: str, changed: list[str], task_id: str | None = None) -> None:
+def write_agent_result(
+    root: Path,
+    summary: str,
+    changed: list[str],
+    task_id: str | None = None,
+    requirement_evidence: list[dict[str, Any]] | None = None,
+) -> None:
     atomic_json(
         sdd_dir(root) / "runtime" / "agent-result.json",
         {
@@ -1421,14 +2498,18 @@ def write_agent_result(root: Path, summary: str, changed: list[str], task_id: st
             "deviations": [],
             "blocking_reason": None,
             "task_id": task_id,
-            "requirement_evidence": [
+            "requirement_evidence": requirement_evidence
+            if requirement_evidence is not None
+            else [
                 {
                     "requirement": "Deterministic fixture behavior",
                     "implementation_files": changed,
                     "test_files": changed,
                     "status": "satisfied",
                 }
-            ] if task_id else [],
+            ]
+            if task_id
+            else [],
             "residual_risks": [],
         },
     )
@@ -1445,16 +2526,20 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
         time.sleep(fixture_stage_delay_seconds)
     directory = change_dir(root, state)
     changed: list[str] = []
+    requirement_evidence: list[dict[str, Any]] | None = None
     if stage == "brainstorm":
         path = directory / "brainstorm.md"
+        constraints = "\n".join(f"- {item}" for item in state.get("competition_constraints", []))
         path.write_text(
             "# Brainstorm\n\n## Objective\n\n"
             + state["objective"]
             + "\n\n## Current State\n\nProject inspected by the deterministic rehearsal executor."
-            "\n\n## Binding Constraints\n\nPreserve protected APIs, dependencies, policies, and build files."
-            "\n\n## Scope\n\nDeliver only the requested bounded behavior."
-            "\n\n## Alternatives\n\n### Option A\n\nMinimal compatible change.\n\n### Option B\n\nBroader redesign."
-            "\n\n## Decision\n\nUse the minimal compatible change.\n\n## Risks\n\nRegression risk is controlled by tests."
+            "\n\n## Binding Constraints\n\n"
+            + constraints
+            + "\n\n## Scope\n\nDeliver the C++ packaging customization, compatibility preservation, tool skill, and verification."
+            "\n\n## Alternatives\n\n### Option A\n\nExtend the existing header format compatibly.\n\n### Option B\n\nReplace the format contract."
+            "\n\n## Decision\n\nUse a backward-compatible header extension with explicit verification of unpack and CLI compatibility."
+            "\n\n## Risks\n\nVariable-length header parsing and backward compatibility require focused regression tests."
             "\n\n## Blocking Ambiguities\n\nNone\n",
             encoding="utf-8",
         )
@@ -1464,34 +2549,43 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
         path.write_text(
             "# Change Proposal\n\n## Why\n\n"
             + state["objective"]
-            + "\n\n## What Changes\n\nAdd one bounded sample capability and its verification."
-            "\n\n## Capabilities\n\n### New Capabilities\n\n- `competition-sample`: Bounded competition behavior."
-            "\n\n### Modified Capabilities\n\n- None\n\n## Impact\n\nSource and tests only; no API or dependency changes.\n",
+            + "\n\n## What Changes\n\nAdd parameter-driven custom header payload support, preserve unpack and legacy CLI behavior, and deliver a callable tool skill."
+            "\n\n## Capabilities\n\n### New Capabilities\n\n- `custom-header-payload`: write variable-length custom header content into the package output.\n- `header-inspection-skill`: inspect header metadata and support THX-related handling through the delivered skill."
+            "\n\n### Modified Capabilities\n\n- Existing pack/unpack flow to parse and preserve customized header payloads.\n\n## Impact\n\nProduction code, tests, and tool skill assets only; no build entrypoint change and no dependency expansion.\n",
             encoding="utf-8",
         )
         changed.append(rel(root, path))
     elif stage == "specs":
-        path = directory / "specs" / "competition-sample" / "spec.md"
+        path = directory / "specs" / "custom-header-payload" / "spec.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            "## ADDED Requirements\n\n### Requirement: Produce bounded competition behavior\n\n"
-            "The system MUST provide the requested behavior without changing protected interfaces.\n\n"
-            "#### Scenario: Successful bounded delivery\n\n"
-            "- **WHEN** the competition task is executed\n"
-            "- **THEN** the requested behavior and automated evidence are produced\n",
+            "## ADDED Requirements\n\n"
+            "### Requirement: Support parameter-driven custom header payload\n\n"
+            "The packaging tool MUST accept a parameter that supplies custom header payload content.\n\n"
+            "#### Scenario: Pack with variable-length custom header payload\n\n"
+            "- **WHEN** the caller provides custom header payload content of arbitrary supported length\n"
+            "- **THEN** the package output stores that payload without corrupting the archive structure\n\n"
+            "### Requirement: Preserve unpack correctness and compatibility\n\n"
+            "The system MUST unpack both legacy and customized package outputs correctly.\n\n"
+            "#### Scenario: Unpack customized package\n\n"
+            "- **WHEN** a package contains customized header payload content\n"
+            "- **THEN** unpack succeeds and restores the original packaged content\n\n"
+            "#### Scenario: Legacy invocation remains valid\n\n"
+            "- **WHEN** the original pack command is executed without the new parameter\n"
+            "- **THEN** behavior remains compatible with the legacy tool contract\n",
             encoding="utf-8",
         )
         changed.append(rel(root, path))
     elif stage == "design":
         path = directory / "design.md"
         path.write_text(
-            "# Technical Design\n\n## Context\n\nA bounded competition change is required."
-            "\n\n## Goals\n\nImplement the requested behavior with tests."
-            "\n\n## Non-Goals\n\nNo API, dependency, policy, or architecture expansion."
+            "# Technical Design\n\n## Context\n\nThe target C++ packaging project must support custom header payload customization under competition constraints."
+            "\n\n## Goals\n\nImplement parameter-driven variable-length header payload support, preserve unpack correctness, preserve legacy entrypoints, and deliver the tool skill."
+            "\n\n## Non-Goals\n\nNo build entrypoint change, no dependency expansion, no broad format redesign."
             "\n\n## Existing API Verification\n\n| API | Source | Result |\n|---|---|---|\n| protected surface | baseline | unchanged |"
-            "\n\n## Architecture and Boundaries\n\nKeep implementation within detected source paths."
-            "\n\n## Decisions\n\nUse a minimal compatible implementation."
-            "\n\n## Testing Strategy\n\nRun focused behavior checks and configured full gates.\n",
+            "\n\n## Architecture and Boundaries\n\nKeep implementation within existing pack/unpack, CLI parsing, and test directories plus the delivered skill asset."
+            "\n\n## Decisions\n\nUse a backward-compatible header extension with explicit length-aware parsing and fallback-safe legacy behavior."
+            "\n\n## Testing Strategy\n\nRun focused checks for variable-length header payloads, customized unpack, legacy CLI invocation, and skill-observable header inspection.\n",
             encoding="utf-8",
         )
         changed.append(rel(root, path))
@@ -1499,9 +2593,9 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
         path = directory / "tasks.md"
         path.write_text(
             "# Tasks\n\n## 1. Implementation\n\n"
-            "- [ ] 1.1 Implement the bounded sample behavior and focused evidence\n"
-            "- [ ] 1.2 Add bounded integration evidence\n"
-            "- [ ] 1.3 Verify the implementation and clean-code constraints\n",
+            "- [ ] 1.1 Implement parameter-driven variable-length custom header payload support with focused tests\n"
+            "- [ ] 1.2 Preserve unpack correctness, original CLI compatibility, and unchanged build entrypoint with regression tests\n"
+            "- [ ] 1.3 Deliver the tool skill for THX-related handling and header inspection, and verify end-to-end behavior\n",
             encoding="utf-8",
         )
         changed.append(rel(root, path))
@@ -1509,27 +2603,87 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
         path = directory / "plan.md"
         path.write_text(
             "# Execution Plan\n\n## Execution Strategy\n\nUse one isolated session per task."
-            "\n\n## Tasks\n\nImplement one task at a time using minimal changes and verification."
-            "\n\n## Verification\n\nRun configured task and full gates."
+            "\n\n## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: custom header payload, variable-length header payload\n"
+            "- Verification: run focused custom-header pack checks and variable-length payload regression\n"
+            "- Evidence: implementation diff, focused test output, and header-related validation logs\n"
+            "- Implementation Targets: src/pack, src/header\n"
+            "- Test Targets: tests/header, tests/pack\n\n"
+            "### Task 1.2\n\n"
+            "- Theme: unpack correctness, legacy CLI compatibility, unchanged build entrypoint\n"
+            "- Verification: run customized unpack regression and original CLI compatibility checks\n"
+            "- Evidence: unpack test output, compatibility test output, and build-entry stability proof\n"
+            "- Implementation Targets: src/unpack, src/cli\n"
+            "- Test Targets: tests/unpack, tests/compatibility\n\n"
+            "### Task 1.3\n\n"
+            "- Theme: skill delivery, THX handling, header inspection\n"
+            "- Verification: run skill invocation checks for THX/header inspection and end-to-end tool behavior\n"
+            "- Evidence: delivered skill files, skill invocation output, and end-to-end validation logs\n"
+            "- Implementation Targets: skill/cpp-unitool-header, src/inspection\n"
+            "- Test Targets: tests/skill, tests/inspection"
+            "\n\n## Verification\n\nRun focused checks for custom-header pack, customized unpack, legacy CLI compatibility, unchanged build entrypoint, and skill behavior."
             "\n\n## Checkpoint Strategy\n\nCommit after each passing deterministic gate.\n",
             encoding="utf-8",
         )
         changed.append(rel(root, path))
     elif stage == "apply":
         task = current_task(root, state)
-        change_token = state["change_id"].replace("-", "_")
-        output = root / "src" / f"autonomous_sdd_rehearsal_{change_token}_{task['id'].replace('.', '_')}.txt"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(f"deterministic competition rehearsal task {task['id']} completed\n", encoding="utf-8")
-        changed.append(rel(root, output))
+        if task["id"] == "1.1":
+            impl = root / "src" / "pack" / "header_payload_fixture.txt"
+            test = root / "tests" / "header" / "header_payload_fixture_test.txt"
+        elif task["id"] == "1.2":
+            impl = root / "src" / "unpack" / "compatibility_fixture.txt"
+            test = root / "tests" / "unpack" / "compatibility_fixture_test.txt"
+        else:
+            impl = root / "src" / "inspection" / "fixture_skill_receipt.txt"
+            test = root / "tests" / "skill" / "fixture_skill_test.txt"
+        impl.parent.mkdir(parents=True, exist_ok=True)
+        test.parent.mkdir(parents=True, exist_ok=True)
+        impl.write_text(f"deterministic competition rehearsal implementation task {task['id']} completed\n", encoding="utf-8")
+        test.write_text(f"deterministic competition rehearsal test task {task['id']} completed\n", encoding="utf-8")
+        changed.extend([rel(root, impl), rel(root, test)])
+        if task["id"] == "1.1":
+            requirement_evidence = [
+                {
+                    "requirement": "Support parameter-driven custom header payload with variable-length header content",
+                    "implementation_files": [rel(root, impl)],
+                    "test_files": [rel(root, test)],
+                    "status": "satisfied",
+                }
+            ]
+        elif task["id"] == "1.2":
+            requirement_evidence = [
+                {
+                    "requirement": "Preserve unpack correctness for customized packages",
+                    "implementation_files": [rel(root, impl)],
+                    "test_files": [rel(root, test)],
+                    "status": "satisfied",
+                },
+                {
+                    "requirement": "Preserve legacy CLI compatibility and unchanged build entrypoint",
+                    "implementation_files": [rel(root, impl)],
+                    "test_files": [rel(root, test)],
+                    "status": "satisfied",
+                },
+            ]
+        else:
+            requirement_evidence = [
+                {
+                    "requirement": "Deliver the tool skill for THX handling and header inspection",
+                    "implementation_files": [rel(root, impl)],
+                    "test_files": [rel(root, test)],
+                    "status": "satisfied",
+                }
+            ]
     elif stage == "verify":
         path = directory / "verify.md"
         path.write_text(
             "# Verification Report\n\n## Structural Validation\n\nPASS"
-            "\n\n## Requirement Traceability\n\nRequirement, implementation, and evidence are mapped."
+            "\n\n## Requirement Traceability\n\nVariable-length custom header payload, unpack correctness, legacy CLI compatibility, unchanged build entrypoint, and skill/header inspection evidence are mapped."
             "\n\n## Protected API and Scope\n\nPASS"
             "\n\n## Dependency Integrity\n\nPASS"
-            "\n\n## Quality Gates\n\nConfigured commands are executed by the Runner."
+            "\n\n## Quality Gates\n\nConfigured commands are executed by the Runner. Custom header payload, unpack, compatibility, and skill checks are covered."
             "\n\n## Findings\n\nNone"
             "\n\n## Decision\n\nPASS\n",
             encoding="utf-8",
@@ -1574,7 +2728,13 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
     else:
         raise SddError(f"Fixture executor cannot execute stage: {stage}")
     task = current_task(root, state) if stage == "apply" else None
-    write_agent_result(root, f"Fixture completed {stage}", changed, task["id"] if task else None)
+    write_agent_result(
+        root,
+        f"Fixture completed {stage}",
+        changed,
+        task["id"] if task else None,
+        requirement_evidence=requirement_evidence,
+    )
     fixture_post_stage_delay_seconds = float(config.get("fixture_post_stage_delay_seconds", 0) or 0)
     if fixture_post_stage_delay_seconds > 0:
         time.sleep(fixture_post_stage_delay_seconds)
@@ -1649,8 +2809,27 @@ def invoke_agent(root: Path, state: dict[str, Any], dry_run: bool) -> None:
     model = config.get("model")
     if model:
         command[2:2] = ["--model", model]
-    timeout = int(config["timeouts"]["agent_seconds"])
-    result = run_command(command, root, timeout=timeout)
+    timeout = agent_timeout_for_state(root, state)
+    try:
+        result = run_command(command, root, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        timed_out = subprocess.CompletedProcess(
+            command,
+            -1,
+            (exc.output or "") + f"\n[TIMEOUT] agent stage exceeded {timeout} seconds\n",
+            None,
+        )
+        evidence = write_evidence(root, f"{state['stage']}-{state['iteration']}-agent-timeout", command, timed_out)
+        append_journal(
+            root,
+            {
+                "event": "agent_timed_out",
+                "stage": state["stage"],
+                "timeout_seconds": timeout,
+                "evidence": evidence,
+            },
+        )
+        raise SddError(f"Agent invocation timed out after {timeout} seconds; see {evidence}") from exc
     evidence = write_evidence(root, f"{state['stage']}-{state['iteration']}-agent", command, result)
     append_journal(
         root,
@@ -1697,6 +2876,14 @@ def validate_stage_artifact(root: Path, state: dict[str, Any]) -> list[str]:
         if len(ids) != len(set(ids)):
             errors.append("tasks.md contains duplicate task IDs")
         return errors
+    if stage == "plan":
+        artifact = directory / "plan.md"
+        if not artifact.exists():
+            return ["Missing plan.md"]
+        for missing in validate_sections(artifact, REQUIRED_SECTIONS.get(stage, [])):
+            errors.append(f"{rel(root, artifact)} missing section: {missing}")
+        errors.extend(validate_plan_contracts(root, state))
+        return errors
     if stage == "apply":
         return errors
     if stage == "archive":
@@ -1714,6 +2901,17 @@ def validate_stage_artifact(root: Path, state: dict[str, Any]) -> list[str]:
         return [f"Missing required artifact: {required_output(root, state)}"]
     for missing in validate_sections(artifact, REQUIRED_SECTIONS.get(stage, [])):
         errors.append(f"{rel(root, artifact)} missing section: {missing}")
+    if stage == "verify":
+        text = normalize_text(artifact.read_text(encoding="utf-8"))
+        expected_markers = {
+            "custom_header_payload": ["custom header", "header payload", "variable-length", "variable length"],
+            "unpack_correctness": ["unpack"],
+            "compatibility": ["compatibility", "legacy cli", "original cli", "build entrypoint"],
+            "skill_delivery": ["skill", "header inspection", "thx"],
+        }
+        for theme, markers in expected_markers.items():
+            if not any(marker in text for marker in markers):
+                errors.append(f"{rel(root, artifact)} missing competition verification evidence for {theme}")
     return errors
 
 
@@ -1730,8 +2928,12 @@ def validate_scope(root: Path, stage: str) -> list[str]:
     competition = load_json(sdd_dir(root) / "policy" / "competition.yaml")
     changed = git_changed(root)
     allowed = competition["modification"]["allowed"]
+    if stage == "apply":
+        allowed = apply_allowed_paths(root, load_state(root))
     errors: list[str] = []
     for path in changed:
+        if stage in {"apply", "review", "verify", "finalize", "archive"} and is_ephemeral_build_output(path):
+            continue
         if path.startswith(".sdd/runtime/") or path.startswith(".sdd/evidence/"):
             continue
         if stage != "apply" and path.startswith("openspec/"):
@@ -1774,6 +2976,8 @@ def execute_gates(root: Path, state: dict[str, Any]) -> tuple[list[str], list[di
         try:
             agent_result = load_json(result_path)
             errors.extend(validate_agent_result(root, state, agent_result))
+            errors.extend(validate_competition_requirement_coverage(root, state, agent_result))
+            errors.extend(validate_plan_commitment_coverage(root, state, agent_result))
             if agent_result.get("status") != "completed":
                 errors.append(f"Agent result status is not completed: {agent_result.get('status')}")
             if stage == "apply":
@@ -1784,15 +2988,22 @@ def execute_gates(root: Path, state: dict[str, Any]) -> tuple[list[str], list[di
                     errors.append(
                         f"Agent result task_id mismatch: expected {task['id']}, got {agent_result.get('task_id')}"
                     )
+                else:
+                    evidence = agent_result.get("requirement_evidence", [])
+                    if isinstance(evidence, list):
+                        errors.extend(
+                            validate_apply_task_requirement_alignment(
+                                root,
+                                state,
+                                task,
+                                evidence,
+                                current_task_contract(root, state),
+                            )
+                        )
         except SddError as exc:
             errors.append(str(exc))
     if stage == "apply":
-        changed = git_changed(root)
-        substantive = [
-            path
-            for path in changed
-            if not path.startswith(("openspec/", ".sdd/"))
-        ]
+        substantive = substantive_changed_paths(root)
         if not substantive:
             errors.append("Apply task made no substantive source or test change")
         declared = sorted(agent_result.get("files_changed", [])) if isinstance(agent_result.get("files_changed"), list) else []
@@ -1828,6 +3039,7 @@ def write_handoff(
     completed_stage: str,
     next_stage: str,
     evidence: list[dict[str, Any]],
+    soft_findings: list[str] | None = None,
 ) -> Path:
     handoff_dir = sdd_dir(root) / "runtime" / "handoffs"
     handoff_dir.mkdir(parents=True, exist_ok=True)
@@ -1853,6 +3065,8 @@ def write_handoff(
         "evidence": evidence,
         "requirement_evidence": agent_result.get("requirement_evidence", []),
         "blocking_findings": [],
+        "soft_findings": list(soft_findings or []),
+        "open_findings": list(state.get("open_findings", [])),
         "residual_risks": list(agent_result.get("residual_risks", []))
         + ([] if completed_stage == "verify" else ["Full project verification has not run yet"]),
         "next_action": "execute_stage" if next_stage != "closed" else "emit_final_report",
@@ -1893,32 +3107,105 @@ def next_stage_after(root: Path, state: dict[str, Any]) -> str:
     return STAGES[STAGES.index(stage) + 1]
 
 
+def terminal_outcome(state: dict[str, Any]) -> str:
+    if state.get("status") != "closed":
+        return str(state.get("status", "unknown"))
+    return str(state.get("terminal_outcome") or "closed_pass")
+
+
+def forced_closeout_outcome(root: Path, state: dict[str, Any]) -> str:
+    if state.get("stage") in {"apply", "review", "verify", "finalize", "archive", "retrospective", "closed"}:
+        return "closed_partial"
+    handoff_dir = sdd_dir(root) / "runtime" / "handoffs"
+    if handoff_dir.exists() and any(handoff_dir.glob("*.json")):
+        return "closed_partial"
+    return "closed_fail"
+
+
+def force_closeout(
+    root: Path,
+    state: dict[str, Any],
+    *,
+    trigger: str,
+    reason: str,
+    gate_errors: list[str] | None = None,
+    recovery_actions: list[str] | None = None,
+) -> dict[str, Any]:
+    prior_stage = str(state.get("stage", "unknown"))
+    outcome = forced_closeout_outcome(root, state)
+    state["status"] = "closed"
+    state["stage"] = "closed"
+    state["terminal_outcome"] = outcome
+    state["blocking_reason"] = reason
+    state["pending_action"] = "emit_final_report"
+    state["next_action"] = "emit_final_report"
+    state["forced_closeout"] = {
+        "trigger": trigger,
+        "reason": reason,
+        "stage": prior_stage,
+        "gate_errors": list(gate_errors or []),
+        "recovery_actions": list(recovery_actions or []),
+        "created_at": now(),
+    }
+    save_state(root, state)
+    emit_final_report(root, state)
+    append_journal(
+        root,
+        {
+            "event": "forced_closeout",
+            "trigger": trigger,
+            "stage": prior_stage,
+            "outcome": outcome,
+            "reason": reason,
+            "gate_errors": list(gate_errors or []),
+        },
+    )
+    return state
+
+
 def gate_and_advance(root: Path) -> None:
     state = load_state(root)
     completed_task = current_task(root, state) if state["stage"] == "apply" else None
     errors, evidence = execute_gates(root, state)
-    if errors:
+    hard_errors, soft_errors = split_gate_findings(state["stage"], errors)
+    if soft_errors:
+        merge_open_findings(state, finding_records(state["stage"], soft_errors, deferred_to="verify"))
+        append_journal(root, {"event": "gate_soft_findings_recorded", "stage": state["stage"], "errors": soft_errors})
+    if hard_errors:
         state["status"] = "repair_required"
-        state["pending_action"] = "gate"
+        state["pending_action"] = "execute_stage"
         key = state["stage"]
         state["retries"][key] = state["retries"].get(key, 0) + 1
         save_state(root, state)
-        append_journal(root, {"event": "gate_failed", "stage": key, "errors": errors})
-        maximum = load_json(sdd_dir(root) / "policy" / "autonomy.yaml")["retry"]["per_stage"]
+        append_journal(root, {"event": "gate_failed", "stage": key, "errors": hard_errors, "soft_errors": soft_errors})
+        maximum = stage_retry_budget(root)
         if state["retries"][key] > maximum:
-            state["status"] = "blocked"
-            state["blocking_reason"] = "retry_budget_exhausted"
-            save_state(root, state)
-        raise SddError("Gate failed:\n- " + "\n- ".join(errors))
+            force_closeout(
+                root,
+                state,
+                trigger="gate_retry_budget_exhausted",
+                reason=f"Gate retry budget exhausted at stage {key}",
+                gate_errors=hard_errors,
+                recovery_actions=[
+                    "Stopped retrying the same gate after retry budget exhaustion.",
+                    "Recorded current gate errors for scoring and downstream review.",
+                    "Emitted final delivery report and receipt instead of leaving the run mid-flight.",
+                ],
+            )
+            print(f"FORCED_CLOSE {key} -> {terminal_outcome(load_state(root))}")
+            return
+        raise SddError("Gate failed:\n- " + "\n- ".join(hard_errors))
     if completed_task:
         complete_task(root, state, completed_task["id"])
+        state.pop("task", None)
         append_journal(
             root,
             {"event": "apply_task_completed", "task_id": completed_task["id"], "title": completed_task["title"]},
         )
     completed = state["stage"]
     next_stage = next_stage_after(root, state)
-    handoff = write_handoff(root, state, completed, next_stage, evidence)
+    reconcile_open_findings(state, completed)
+    handoff = write_handoff(root, state, completed, next_stage, evidence, soft_findings=soft_errors)
     if next_stage == "closed":
         preview = dict(state)
         preview["status"] = "closed"
@@ -1926,12 +3213,24 @@ def gate_and_advance(root: Path) -> None:
     commit = checkpoint(root, state, completed)
     state["stage"] = next_stage
     state["status"] = "closed" if next_stage == "closed" else "running"
+    if next_stage == "closed":
+        state["terminal_outcome"] = "closed_pass"
+    else:
+        state.pop("terminal_outcome", None)
+    if next_stage == "apply":
+        next_task = unchecked_tasks(root, state)
+        state["task"] = next_task[0]["id"] if next_task else None
+    else:
+        state["task"] = None
     state["last_verified_commit"] = commit
     state["last_handoff"] = rel(root, handoff)
     state["next_action"] = "emit_final_report" if next_stage == "closed" else "execute_stage"
     state["pending_action"] = "execute_stage"
     state["iteration"] += 1
     state["retries"].pop(completed, None)
+    state.pop("blocking_reason", None)
+    state.pop("forced_closeout", None)
+    clear_failure_signature(root, state, completed)
     save_state(root, state)
     append_journal(root, {"event": "stage_advanced", "from": completed, "to": next_stage, "commit": commit})
     print(f"PASS {completed} -> {next_stage} at {commit}")
@@ -1985,51 +3284,129 @@ def run_loop(args: argparse.Namespace) -> None:
                     raise SddError(f"Cannot continue run with pending action: {pending_action}")
             except SddError as exc:
                 state = load_state(root)
+                if state["status"] == "closed":
+                    if not (sdd_dir(root) / "delivery-report.md").exists():
+                        emit_final_report(root, state)
+                    print(json.dumps(state, indent=2, ensure_ascii=False))
+                    return
                 key = state["stage"]
+                signature, signature_count = record_failure_signature(root, state, str(exc))
                 if state["status"] != "repair_required":
                     state["retries"][key] = state["retries"].get(key, 0) + 1
-                maximum = load_json(sdd_dir(root) / "policy" / "autonomy.yaml")["retry"]["per_stage"]
-                if state["retries"].get(key, 0) > maximum:
-                    state["status"] = "blocked"
-                    state["blocking_reason"] = str(exc)
+                maximum = stage_retry_budget(root)
+                repeated_failure_budget = budget_value(root, "maximum_repeated_failure_signatures", 4)
+                if signature_count > repeated_failure_budget:
+                    force_closeout(
+                        root,
+                        state,
+                        trigger="repeated_failure_signature_budget_exhausted",
+                        reason=(
+                            f"repeated failure signature exceeded budget: {signature} "
+                            f"({signature_count}>{repeated_failure_budget})"
+                        ),
+                        recovery_actions=[
+                            "Stopped repeating an identical failing step signature.",
+                            "Captured the recurring failure signature in the final receipt.",
+                            "Closed the run with best-effort scoring evidence.",
+                        ],
+                    )
+                    print(json.dumps(load_state(root), indent=2, ensure_ascii=False))
+                    return
+                elif state["retries"].get(key, 0) > maximum:
+                    force_closeout(
+                        root,
+                        state,
+                        trigger="stage_retry_budget_exhausted",
+                        reason=str(exc),
+                        recovery_actions=[
+                            "Stopped retrying the current stage after retry budget exhaustion.",
+                            "Preserved current state, evidence, and error context in the final receipt.",
+                            "Closed the run instead of leaving it blocked mid-stage.",
+                        ],
+                    )
+                    print(json.dumps(load_state(root), indent=2, ensure_ascii=False))
+                    return
                 else:
                     state["status"] = "repair_required" if git_changed(root) else "running"
                 save_state(root, state)
-                if state["status"] == "blocked":
-                    raise
                 append_journal(
                     root,
                     {"event": "repair_cycle_started", "stage": state["stage"], "reason": str(exc)},
                 )
             steps += 1
         state = load_state(root)
-        state["status"] = "blocked"
-        state["blocking_reason"] = f"maximum runner steps reached: {args.max_steps}"
-        save_state(root, state)
-        raise SddError(state["blocking_reason"])
+        force_closeout(
+            root,
+            state,
+            trigger="maximum_runner_steps_reached",
+            reason=f"maximum runner steps reached: {args.max_steps}",
+            recovery_actions=[
+                "Stopped the unattended loop after exhausting the configured step budget.",
+                "Preserved the latest state snapshot and evidence logs.",
+                "Closed the run with a final receipt for downstream scoring.",
+            ],
+        )
+        print(json.dumps(load_state(root), indent=2, ensure_ascii=False))
+        return
 
 
 def emit_final_report(root: Path, state: dict[str, Any]) -> Path:
     report = sdd_dir(root) / "delivery-report.md"
+    receipt = sdd_dir(root) / "delivery-receipt.json"
     handoffs = list((sdd_dir(root) / "changes" / state["change_id"] / "handoffs").glob("*.json"))
     evidence = list((sdd_dir(root) / "evidence").glob("*.log"))
+    outcome = terminal_outcome(state).upper()
+    forced = state.get("forced_closeout", {})
+    open_findings = list(state.get("open_findings", []))
+    resolved_findings = list(state.get("resolved_findings", []))
     result_text = (
         "The persisted state, archive, handoffs, and configured gates completed consistently."
-        if state["status"] == "closed"
-        else f"The run stopped safely. Blocking reason: `{state.get('blocking_reason', 'unknown')}`."
+        if terminal_outcome(state) == "closed_pass"
+        else (
+            "The run was force-closed with best-effort scoring evidence after automated recovery limits were reached."
+            if state["status"] == "closed"
+            else f"The run stopped safely. Blocking reason: `{state.get('blocking_reason', 'unknown')}`."
+        )
     )
     report.write_text(
         "# Autonomous SDD Delivery Report\n\n"
-        f"- Outcome: `{state['status'].upper()}`\n"
+        f"- Outcome: `{outcome}`\n"
+        f"- Terminal Status: `{state['status'].upper()}`\n"
         f"- Change: `{state['change_id']}`\n"
         f"- Objective: {state['objective']}\n"
         f"- Baseline commit: `{state['baseline_commit']}`\n"
         f"- Verified commit before final receipt: `{state['last_verified_commit']}`\n"
         f"- Model selection: `{state.get('model_selection', 'unknown')}`\n"
         f"- Stage handoffs: `{len(handoffs)}`\n"
-        f"- Evidence logs: `{len(evidence)}`\n\n"
+        f"- Evidence logs: `{len(evidence)}`\n"
+        f"- Open findings: `{len(open_findings)}`\n"
+        f"- Resolved findings: `{len(resolved_findings)}`\n\n"
         f"## Result\n\n{result_text}\n",
         encoding="utf-8",
+    )
+    atomic_json(
+        receipt,
+        {
+            "schema_version": 1,
+            "run_id": state["run_id"],
+            "change_id": state["change_id"],
+            "status": state["status"],
+            "outcome": terminal_outcome(state),
+            "objective": state["objective"],
+            "stage": state.get("stage"),
+            "last_verified_commit": state.get("last_verified_commit"),
+            "report": rel(root, report),
+            "passed_handoffs": len(handoffs),
+            "evidence_logs": len(evidence),
+            "open_findings": open_findings,
+            "resolved_findings": resolved_findings,
+            "forced_closeout": forced if isinstance(forced, dict) else {},
+            "score_signals": {
+                "completed_lifecycle": terminal_outcome(state) == "closed_pass",
+                "forced_closeout_used": bool(forced),
+                "best_effort_result_available": state["status"] == "closed",
+            },
+        },
     )
     return report
 
@@ -2098,13 +3475,15 @@ def rehearse_recovery(args: argparse.Namespace) -> None:
     with services.locks():
         snapshot = services.workspace.initialize(VERSION)
     root = services.workspace.work_project_root
-    objective = read_task(args.task, source_root)
+    objective_bundle = resolve_competition_objective(getattr(args, "task", None), source_root)
+    objective = objective_bundle["effective_objective"]
     change_id = unique_change_id(root, args.change_id or slugify(objective))
     start(
         argparse.Namespace(
             project=str(root),
             change_id=change_id,
             objective=objective,
+            objective_bundle=objective_bundle,
             executor="fixture",
             source_root=str(source_root),
             work_root=str(snapshot.work_root),
@@ -2136,7 +3515,7 @@ def rehearse_recovery(args: argparse.Namespace) -> None:
     compete(
         argparse.Namespace(
             project=str(source_root),
-            task=objective,
+            task=args.task,
             change_id=change_id,
             executor="fixture",
             max_steps=args.max_steps,
@@ -2353,7 +3732,10 @@ def parser() -> argparse.ArgumentParser:
     init.set_defaults(func=init_project)
 
     competition = sub.add_parser("compete", help="Run the entire competition workflow with one command")
-    competition.add_argument("--task", required=True, help="Task file path or inline task text")
+    competition.add_argument(
+        "--task",
+        help="Optional task file path or inline task text; default is the built-in C++ competition objective",
+    )
     competition.add_argument("--change-id", help="Optional kebab-case change identifier")
     competition.add_argument("--executor", choices=["opencode", "fixture"], default="opencode")
     competition.add_argument("--max-steps", type=int, default=50)
@@ -2390,7 +3772,10 @@ def parser() -> argparse.ArgumentParser:
         "rehearse-recovery",
         help="Create a deterministic interrupted run, recover it automatically, and finish the workflow",
     )
-    rehearse_recovery_cmd.add_argument("--task", required=True, help="Task file path or inline task text")
+    rehearse_recovery_cmd.add_argument(
+        "--task",
+        help="Optional task file path or inline task text; default is the built-in C++ competition objective",
+    )
     rehearse_recovery_cmd.add_argument("--change-id", help="Optional kebab-case change identifier")
     rehearse_recovery_cmd.add_argument("--max-steps", type=int, default=50)
     rehearse_recovery_cmd.add_argument("--retry-seconds", type=float, default=10)

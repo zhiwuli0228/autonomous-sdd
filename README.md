@@ -151,6 +151,20 @@ openspec/specs/
 openspec/changes/archive/
 ```
 
+比赛提交包相关设计文档：
+
+- `docs/competition_submission_package_design.md`
+- `docs/competition_submission_prompt.md`
+- `docs/cpp_competition_goal_freeze_design.md`
+- `docs/cpp_competition_goal_freeze_prompt.md`
+- `docs/competition_objective_input_and_freeze_design.md`
+- `docs/competition_design_traceability_design.md`
+- `docs/competition_development_trace_design.md`
+- `docs/cpp_competition_autonomous_design.md`
+- `docs/cpp_tool_skill_design.md`
+- `docs/cpp_competition_execution_prompt.md`
+- `docs/cpp_competition_operator_guide.md`
+
 运行时状态保存在 `.sdd/runtime/`，默认不会提交到 Git。
 
 如果系统无法在安全边界内继续执行，会返回非零退出码，并记录：

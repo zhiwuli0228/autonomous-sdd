@@ -19,6 +19,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "timeouts": {
         "agent_seconds": 1200,
+        "stage_agent_seconds": {},
         "focused_test_seconds": 300,
         "verification_seconds": 3600,
     },
@@ -28,7 +29,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "maximum_review_cycles": 3,
         "maximum_verify_repairs": 2,
         "maximum_wall_seconds": 7200,
-        "maximum_repeated_failure_signatures": 2,
+        "maximum_repeated_failure_signatures": 4,
     },
     "git": {
         "auto_commit": True,
@@ -180,6 +181,13 @@ def _validate_config(config: Mapping[str, Any]) -> None:
         raise ConfigurationError("config.executor.model must be null or a non-empty string")
     timeouts = config["timeouts"]
     _require_int(timeouts["agent_seconds"], "config.timeouts.agent_seconds", 10, 7200)
+    stage_agent_seconds = timeouts["stage_agent_seconds"]
+    if not isinstance(stage_agent_seconds, Mapping):
+        raise ConfigurationError("config.timeouts.stage_agent_seconds must be an object")
+    for stage, value in stage_agent_seconds.items():
+        if not isinstance(stage, str) or not stage.strip():
+            raise ConfigurationError("config.timeouts.stage_agent_seconds keys must be non-empty strings")
+        _require_int(value, f"config.timeouts.stage_agent_seconds.{stage}", 10, 7200)
     _require_int(timeouts["focused_test_seconds"], "config.timeouts.focused_test_seconds", 5, 3600)
     _require_int(timeouts["verification_seconds"], "config.timeouts.verification_seconds", 10, 14400)
     budget = config["budget"]

@@ -6,6 +6,10 @@
 
 | Requirement/Scenario | Implementation | Test | Evidence | Status |
 |---|---|---|---|---|
+| variable-length custom header payload |  |  |  |  |
+| unpack customized package |  |  |  |  |
+| legacy CLI compatibility |  |  |  |  |
+| skill-observable header inspection |  |  |  |  |
 
 ## Protected API and Scope
 

@@ -69,8 +69,174 @@ class RunnerSmokeTest(unittest.TestCase):
         packet = json.loads(output)
         self.assertEqual("brainstorm", packet["stage"])
         self.assertEqual("sample-change", packet["change_id"])
+        self.assertIn("frozen_goal", packet)
+        self.assertIn("competition_constraints", packet)
+        self.assertIn("required_acceptance_invariants", packet)
+        self.assertIn("tooling_integration_constraints", packet)
         state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
         self.assertEqual("opencode-default", state["model_selection"])
+        self.assertEqual("inline", state["objective_source"])
+        objective_bundle = json.loads(
+            (self.project / ".sdd" / "runtime" / "competition-objective.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual("inline", objective_bundle["source"])
+
+    def test_resolve_competition_objective_defaults_to_frozen_cpp_goal(self) -> None:
+        bundle = SDD.resolve_competition_objective(None, self.project)
+        self.assertEqual("default", bundle["source"])
+        self.assertTrue(bundle["branch_default_used"])
+        self.assertEqual(SDD.DEFAULT_COMPETITION_GOAL, bundle["effective_objective"])
+        self.assertIn("Unpack must still work correctly after customization.", bundle["competition_constraints"])
+        self.assertIn("skill_delivery_required", bundle["required_acceptance_invariants"])
+
+    def test_compete_allows_missing_task_and_uses_default_objective(self) -> None:
+        run("--project", str(self.project), "baseline")
+        with (
+            mock.patch.object(SDD, "run_loop") as run_loop,
+            mock.patch.object(SDD, "finalize_competition_run", return_value={"status": "closed"}) as finalize,
+        ):
+            SDD.compete(
+                argparse.Namespace(
+                    project=str(self.project),
+                    task=None,
+                    change_id="default-goal",
+                    executor="fixture",
+                    max_steps=1,
+                )
+            )
+        run_loop.assert_called_once()
+        finalize.assert_called_once()
+        active_root = Path(run_loop.call_args.args[0].project)
+        state = json.loads((active_root / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(SDD.DEFAULT_COMPETITION_GOAL, state["objective"])
+        self.assertEqual("default", state["objective_source"])
+
+    def test_apply_packet_includes_current_task_contract(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "packet-contract",
+            "Implement a bounded sample behavior for runner verification",
+        )
+        change_dir = self.project / "openspec" / "changes" / "packet-contract"
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [ ] 1.1 Implement parameter-driven variable-length custom header payload support with focused tests\n",
+            encoding="utf-8",
+        )
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: custom header payload and variable-length header handling\n"
+            "- Verification: run focused custom-header pack checks and variable-length payload regression\n"
+            "- Evidence: implementation diff, focused test output, and header-related validation logs\n"
+            "- Implementation Targets: src/pack, src/header\n"
+            "- Test Targets: tests/header, tests/pack\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        state_path = self.project / ".sdd" / "runtime" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["stage"] = "apply"
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        packet = json.loads(run("--project", str(self.project), "run-once", "--dry-run").stdout)
+        self.assertEqual("1.1", packet["task_id"])
+        self.assertIn("current_task_contract", packet)
+        self.assertEqual(
+            "src/pack, src/header",
+            packet["current_task_contract"]["implementation_targets"],
+        )
+        self.assertEqual(
+            "tests/header, tests/pack",
+            packet["current_task_contract"]["test_targets"],
+        )
+        self.assertNotIn("openspec/changes/packet-contract/tasks.md", packet["allowed_paths"])
+
+    def test_apply_packet_synthesizes_contract_from_tasks_when_plan_contract_is_missing(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "packet-synthesized-contract",
+            "Recover apply scope from tasks when plan contracts drift",
+        )
+        change_dir = self.project / "openspec" / "changes" / "packet-synthesized-contract"
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [ ] 1.7 Deliver the tool skill at `skills/unitool/SKILL.md` with THX handling and header inspection\n"
+            "  - Write skill content with THX-related handling guidance.\n"
+            "  - Include header inspection workflows (using `packtool info` to inspect archive headers).\n",
+            encoding="utf-8",
+        )
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: custom header payload\n"
+            "- Verification: run tests\n"
+            "- Evidence: logs\n"
+            "- Implementation Targets: src/archive.h\n"
+            "- Test Targets: tests/test_packager.cpp\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        state_path = self.project / ".sdd" / "runtime" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["stage"] = "apply"
+        state["task"] = "1.7"
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        packet = json.loads(run("--project", str(self.project), "run-once", "--dry-run").stdout)
+        self.assertEqual("1.7", packet["task_id"])
+        self.assertEqual("skills/unitool/SKILL.md", packet["current_task_contract"]["implementation_targets"])
+        self.assertEqual("None (documentation-only change)", packet["current_task_contract"]["test_targets"])
+        self.assertEqual("synthesized", packet["current_task_contract"]["_source"])
+        self.assertIn("THX-related handling guidance.", packet["task_details"])
+        self.assertIn("skills/unitool/SKILL.md", packet["allowed_paths"])
+        self.assertIn("openspec/changes/packet-synthesized-contract/tasks.md", packet["required_reads"])
+
+    def test_apply_packet_allows_contract_targets_outside_default_source_globs(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "packet-allowed-targets",
+            "Deliver a documentation skill update through apply packet targets",
+        )
+        change_dir = self.project / "openspec" / "changes" / "packet-allowed-targets"
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [ ] 1.1 Update skill documentation for header inspection\n",
+            encoding="utf-8",
+        )
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: skill delivery, THX handling, header inspection\n"
+            "- Verification: review the exact skill file content and confirm THX/header inspection guidance is present\n"
+            "- Evidence: updated skill file path plus content review proof for THX handling and header inspection sections\n"
+            "- Implementation Targets: skills/unitool/SKILL.md\n"
+            "- Test Targets: None (documentation-only change)\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        state_path = self.project / ".sdd" / "runtime" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["stage"] = "apply"
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        packet = json.loads(run("--project", str(self.project), "run-once", "--dry-run").stdout)
+        self.assertIn("skills/unitool/skill.md", [path.lower() for path in packet["allowed_paths"]])
 
     def test_status_and_recover_include_workspace_overview(self) -> None:
         run("--project", str(self.project), "baseline")
@@ -793,7 +959,7 @@ class RunnerSmokeTest(unittest.TestCase):
         self.assertTrue((self.project / ".sdd" / "delivery-report.md").exists())
         archives = list((self.project / "openspec" / "changes" / "archive").glob("*-complete-rehearsal"))
         self.assertEqual(1, len(archives))
-        self.assertTrue((self.project / "openspec" / "specs" / "competition-sample" / "spec.md").exists())
+        self.assertTrue((self.project / "openspec" / "specs" / "custom-header-payload" / "spec.md").exists())
 
     def test_compete_bootstraps_plain_repository(self) -> None:
         plain = self.temp / "plain"
@@ -950,7 +1116,7 @@ class RunnerSmokeTest(unittest.TestCase):
             stdout=subprocess.PIPE,
         ).stdout.splitlines())
 
-    def test_one_command_failure_exhausts_budget_and_reports_blocked(self) -> None:
+    def test_one_command_failure_exhausts_budget_and_reports_terminal_result(self) -> None:
         config_path = self.project / ".sdd" / "config.yaml"
         config = json.loads(config_path.read_text(encoding="utf-8"))
         config["fixture_fail_stage"] = "proposal"
@@ -969,19 +1135,24 @@ class RunnerSmokeTest(unittest.TestCase):
             "fixture",
             "--max-steps",
             "20",
-            expected=4,
         )
         self.assertIn("Injected deterministic failure at stage proposal", result.stdout)
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual("competition_result", payload["kind"])
-        self.assertEqual("blocked", payload["status"])
-        self.assertEqual("blocked", payload["decision"])
-        self.assertEqual("manual_repair", payload["recommended_action"])
-        self.assertEqual(4, payload["exit_code"])
+        self.assertEqual("closed", payload["status"])
+        self.assertEqual("closed_partial", payload["outcome"])
+        self.assertEqual("completed_partial", payload["decision"])
+        self.assertEqual("none", payload["recommended_action"])
+        self.assertEqual(0, payload["exit_code"])
         state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual("blocked", state["status"])
+        self.assertEqual("closed", state["status"])
+        self.assertEqual("closed_partial", state["terminal_outcome"])
+        self.assertIn("forced_closeout", state)
         report = (self.project / ".sdd" / "delivery-report.md").read_text(encoding="utf-8")
-        self.assertIn("Outcome: `BLOCKED`", report)
+        self.assertIn("Outcome: `CLOSED_PARTIAL`", report)
+        receipt = json.loads((self.project / ".sdd" / "delivery-receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual("closed_partial", receipt["outcome"])
+        self.assertTrue(receipt["score_signals"]["best_effort_result_available"])
 
     def test_default_api_paths_are_frozen_by_baseline(self) -> None:
         api = self.project / "src" / "main" / "java" / "sample" / "api" / "StableApi.java"
@@ -1044,6 +1215,67 @@ class RunnerSmokeTest(unittest.TestCase):
         self.assertIn("- [x] 1.1", tasks)
         self.assertIn("- [x] 1.2", tasks)
 
+    def test_current_task_remains_pinned_when_tasks_md_is_edited_by_agent(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "pinned-apply-task",
+            "Keep apply task identity stable even if tasks.md is edited unexpectedly",
+        )
+        change_dir = self.project / "openspec" / "changes" / "pinned-apply-task"
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [x] 1.1 First task\n"
+            "- [ ] 1.2 Second task\n"
+            "- [ ] 1.3 Third task\n",
+            encoding="utf-8",
+        )
+        state_path = self.project / ".sdd" / "runtime" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["stage"] = "apply"
+        state["task"] = "1.2"
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [x] 1.1 First task\n"
+            "- [x] 1.2 Second task\n"
+            "- [ ] 1.3 Third task\n",
+            encoding="utf-8",
+        )
+        pinned = SDD.current_task(self.project, json.loads(state_path.read_text(encoding="utf-8")))
+        self.assertIsNotNone(pinned)
+        self.assertEqual("1.2", pinned["id"])
+        SDD.complete_task(self.project, json.loads(state_path.read_text(encoding="utf-8")), "1.2")
+        errors = SDD.validate_scope(self.project, "apply")
+        self.assertTrue(any("openspec/changes/pinned-apply-task/tasks.md" in error for error in errors))
+
+    def test_apply_stage_required_reads_excludes_tasks_md(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "apply-required-reads",
+            "Keep apply required reads focused on the current task contract and implementation context",
+        )
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        state["stage"] = "apply"
+        (self.project / ".sdd" / "runtime" / "state.json").write_text(
+            json.dumps(state, indent=2) + "\n", encoding="utf-8"
+        )
+        change_dir = self.project / "openspec" / "changes" / "apply-required-reads"
+        (change_dir / "design.md").write_text("# Design\n", encoding="utf-8")
+        (change_dir / "plan.md").write_text("# Plan\n", encoding="utf-8")
+        (change_dir / "tasks.md").write_text("# Tasks\n", encoding="utf-8")
+        (change_dir / "brainstorm.md").write_text("# Brainstorm\n", encoding="utf-8")
+        reads = SDD.stage_required_reads(self.project, state)
+        self.assertIn("openspec/changes/apply-required-reads/design.md", reads)
+        self.assertIn("openspec/changes/apply-required-reads/plan.md", reads)
+        self.assertNotIn("openspec/changes/apply-required-reads/tasks.md", reads)
+        self.assertNotIn("openspec/changes/apply-required-reads/brainstorm.md", reads)
+
     def test_timeout_terminates_descendant_process(self) -> None:
         marker = self.temp / "descendant-survived.txt"
         child = (
@@ -1058,6 +1290,430 @@ class RunnerSmokeTest(unittest.TestCase):
             SDD.run_command([sys.executable, "-c", parent], self.project, timeout=1)
         time.sleep(2)
         self.assertFalse(marker.exists(), "descendant process survived command timeout")
+
+    def test_invoke_agent_timeout_becomes_sdd_error_with_evidence(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "agent-timeout",
+            "Ensure unattended agent timeout is recorded and converted into a recoverable runner error",
+        )
+        config_path = self.project / ".sdd" / "config.yaml"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["timeouts"]["stage_agent_seconds"] = {"specs": 17}
+        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        state["stage"] = "specs"
+        timeout = subprocess.TimeoutExpired(["opencode", "run"], 17, output="partial output")
+        with mock.patch.object(SDD, "run_command", side_effect=timeout):
+            with self.assertRaises(SDD.SddError) as exc:
+                SDD.invoke_agent(self.project, state, False)
+        self.assertIn("timed out after", str(exc.exception))
+        evidence = sorted((self.project / ".sdd" / "evidence").glob("*agent-timeout.log"))
+        self.assertEqual(1, len(evidence))
+        content = evidence[0].read_text(encoding="utf-8")
+        self.assertIn("partial output", content)
+        self.assertIn("[TIMEOUT] agent stage exceeded 17 seconds", content)
+        journal = (self.project / ".sdd" / "runtime" / "execution-journal.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"event": "agent_timed_out"', journal)
+        self.assertIn('"stage": "specs"', journal)
+
+    def test_run_loop_force_closes_after_repeated_failure_signature_budget(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "repeated-signature",
+            "Stop an unattended run after the same failure repeats beyond budget",
+        )
+        config_path = self.project / ".sdd" / "config.yaml"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["budget"]["maximum_repeated_failure_signatures"] = 2
+        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        with (
+            mock.patch.object(SDD, "validate_execution_preflight"),
+            mock.patch.object(SDD, "execute_stage", side_effect=SDD.SddError("OpenCode invocation failed; see timeout.log")),
+            mock.patch.object(SDD, "git_changed", return_value=[]),
+        ):
+            SDD.run_loop(argparse.Namespace(project=str(self.project), max_steps=5))
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual("closed", state["status"])
+        self.assertEqual("closed_fail", state["terminal_outcome"])
+        self.assertIn("repeated failure signature exceeded budget", state["blocking_reason"])
+        self.assertEqual(3, state["failure_signatures"]["brainstorm:agent_exit_nonzero"])
+        receipt = json.loads((self.project / ".sdd" / "delivery-receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual("closed_fail", receipt["outcome"])
+        self.assertTrue(receipt["score_signals"]["forced_closeout_used"])
+
+    def test_gate_and_advance_force_closes_partial_after_gate_retry_budget(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "forced-partial",
+            "Ensure gate retry exhaustion still produces a terminal partial result",
+        )
+        state_path = self.project / ".sdd" / "runtime" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["stage"] = "verify"
+        state["status"] = "repair_required"
+        state["pending_action"] = "gate"
+        maximum = json.loads((self.project / ".sdd" / "config.yaml").read_text(encoding="utf-8"))["budget"][
+            "maximum_stage_retries"
+        ]
+        state["retries"]["verify"] = maximum
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        with mock.patch.object(SDD, "execute_gates", return_value=(["Missing required artifact: verify.md"], [])):
+            SDD.gate_and_advance(self.project)
+        final_state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual("closed", final_state["status"])
+        self.assertEqual("closed_partial", final_state["terminal_outcome"])
+        self.assertEqual("closed", final_state["stage"])
+        self.assertEqual("gate_retry_budget_exhausted", final_state["forced_closeout"]["trigger"])
+        self.assertIn("Missing required artifact: verify.md", final_state["forced_closeout"]["gate_errors"])
+
+    def test_stage_retry_budget_is_configurable(self) -> None:
+        run("--project", str(self.project), "baseline")
+        config_path = self.project / ".sdd" / "config.yaml"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(1, config["budget"]["maximum_stage_retries"])
+        config["budget"]["maximum_stage_retries"] = 3
+        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(3, SDD.stage_retry_budget(self.project))
+
+    def test_gate_and_advance_allows_soft_plan_findings_to_continue(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "soft-plan-findings",
+            "Continue past generic plan wording while recording findings",
+        )
+        state_path = self.project / ".sdd" / "runtime" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["stage"] = "plan"
+        state["status"] = "running"
+        state["pending_action"] = "gate"
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        with (
+            mock.patch.object(
+                SDD,
+                "execute_gates",
+                return_value=(
+                    [
+                        "plan.md task 1.5 implementation_targets is too generic",
+                        "plan.md task 1.5 evidence is too generic",
+                    ],
+                    [],
+                ),
+            ),
+            mock.patch.object(SDD, "next_stage_after", return_value="apply"),
+            mock.patch.object(SDD, "write_handoff", return_value=self.project / ".sdd" / "runtime" / "handoffs" / "x.json"),
+            mock.patch.object(SDD, "checkpoint", return_value="abc123"),
+        ):
+            SDD.gate_and_advance(self.project)
+        final_state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual("apply", final_state["stage"])
+        self.assertEqual("running", final_state["status"])
+        self.assertEqual(2, len(final_state["open_findings"]))
+        self.assertTrue(all(item["severity"] == "soft" for item in final_state["open_findings"]))
+
+    def test_gate_and_advance_requeues_stage_execution_after_hard_gate_failure(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "gate-requeue",
+            "Retry the current stage by executing it again after a hard gate failure",
+        )
+        state_path = self.project / ".sdd" / "runtime" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["stage"] = "apply"
+        state["status"] = "running"
+        state["task"] = "1.1"
+        state["pending_action"] = "gate"
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        with mock.patch.object(
+            SDD,
+            "execute_gates",
+            return_value=(["Agent result is missing"], []),
+        ):
+            with self.assertRaises(SDD.SddError):
+                SDD.gate_and_advance(self.project)
+        final_state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual("repair_required", final_state["status"])
+        self.assertEqual("execute_stage", final_state["pending_action"])
+        self.assertEqual(1, final_state["retries"]["apply"])
+
+    def test_emit_final_report_includes_open_and_resolved_findings(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "receipt-findings",
+            "Surface deferred and resolved findings in the final receipt",
+        )
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        state["status"] = "closed"
+        state["stage"] = "closed"
+        state["terminal_outcome"] = "closed_partial"
+        state["open_findings"] = [{"stage": "plan", "severity": "soft", "message": "generic target", "status": "open"}]
+        state["resolved_findings"] = [
+            {"stage": "plan", "severity": "soft", "message": "generic evidence", "status": "reviewed_in_verify"}
+        ]
+        SDD.save_state(self.project, state)
+        SDD.emit_final_report(self.project, state)
+        receipt = json.loads((self.project / ".sdd" / "delivery-receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(1, len(receipt["open_findings"]))
+        self.assertEqual(1, len(receipt["resolved_findings"]))
+
+    def test_validate_agent_result_tolerates_known_metadata_fields(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "metadata-compat",
+            "Accept compatible agent metadata fields without blocking unattended execution",
+        )
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        result = {
+            "schema_version": 1,
+            "run_id": state["run_id"],
+            "change_id": state["change_id"],
+            "stage": state["stage"],
+            "status": "completed",
+            "summary": "completed",
+            "files_read": [],
+            "files_changed": [],
+            "commands_run": [],
+            "tests": [],
+            "deviations": [],
+            "blocking_reason": None,
+            "task_id": None,
+            "requirement_evidence": [],
+            "residual_risks": [],
+        }
+        self.assertEqual([], SDD.validate_agent_result(self.project, state, result))
+        result["role"] = "tasks"
+        self.assertEqual([], SDD.validate_agent_result(self.project, state, result))
+        result["created_at"] = "2026-06-27T00:00:00Z"
+        self.assertEqual([], SDD.validate_agent_result(self.project, state, result))
+        result["unexpected"] = True
+        errors = SDD.validate_agent_result(self.project, state, result)
+        self.assertTrue(any("unsupported fields: unexpected" in error for error in errors))
+
+    def test_prompt_for_non_apply_forbids_build_and_test_commands(self) -> None:
+        packet = {
+            "stage": "brainstorm",
+            "required_output": "openspec/changes/example/brainstorm.md",
+        }
+        prompt = SDD.prompt_for(packet)
+        self.assertIn("do not run build, compile, test, cmake, ctest, packaging, or cleanup commands", prompt)
+        self.assertIn("Current stage: brainstorm.", prompt)
+
+    def test_prompt_for_apply_forbids_posix_shell_idioms_on_windows(self) -> None:
+        packet = {
+            "stage": "apply",
+            "required_output": "complete exactly task 1.2",
+        }
+        prompt = SDD.prompt_for(packet)
+        self.assertIn("do not use POSIX shell idioms such as `mkdir -p`", prompt)
+        self.assertIn("reuse existing build directories when present", prompt)
+        self.assertIn("Treat packet.allowed_paths and the task contract implementation_targets/test_targets as the hard scope boundary", prompt)
+        self.assertIn("leave them unchanged and record the gap in residual_risks instead", prompt)
+        self.assertIn("Do not read, glob, diff, or inspect source_root/work_root paths from state.json", prompt)
+        self.assertIn("If any command, tool call, or directory access is denied, immediately write .sdd/runtime/agent-result.json with status blocked", prompt)
+        self.assertIn("If the contract was synthesized, use task_details as additional binding scope and acceptance context", prompt)
+
+    def test_prompt_for_verify_requires_workspace_local_outputs(self) -> None:
+        packet = {
+            "stage": "verify",
+            "required_output": "openspec/changes/example/verify.md",
+        }
+        prompt = SDD.prompt_for(packet)
+        self.assertIn("do not use external temp roots such as /tmp, C:\\tmp, %TEMP%", prompt)
+        self.assertIn("you must write the required verify artifact and .sdd/runtime/agent-result.json", prompt)
+        self.assertIn("return status blocked with exact evidence", prompt)
+
+    def test_validate_residual_risks_accepts_strings_and_structured_objects(self) -> None:
+        self.assertEqual([], SDD.validate_residual_risks(["risk a", "risk b"]))
+        self.assertEqual(
+            [],
+            SDD.validate_residual_risks(
+                [
+                    {"risk": "definition ambiguity", "mitigation": "document interpretation"},
+                    {"risk": "tooling convention unknown"},
+                ]
+            ),
+        )
+        errors = SDD.validate_residual_risks([{"risk": ""}])
+        self.assertTrue(any("risk must be a non-empty string" in error for error in errors))
+
+    def test_validate_agent_result_accepts_stage_specific_requirement_statuses(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "stage-status-compat",
+            "Accept stage-specific requirement evidence statuses before apply",
+        )
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        result = {
+            "status": "completed",
+            "summary": "ok",
+            "files_read": [],
+            "files_changed": [],
+            "commands_run": [],
+            "tests": [],
+            "deviations": [],
+            "blocking_reason": None,
+            "task_id": None,
+            "requirement_evidence": [
+                {
+                    "requirement": "Support custom header payload content through a parameter",
+                    "implementation_files": [],
+                    "test_files": [],
+                    "status": "addressed_in_brainstorm",
+                }
+            ],
+            "residual_risks": [],
+        }
+        self.assertEqual([], SDD.validate_agent_result(self.project, state, result))
+        result["requirement_evidence"][0]["status"] = "addressed_in_plan"
+        self.assertEqual([], SDD.validate_agent_result(self.project, state, result))
+        result["requirement_evidence"][0]["status"] = "analyzed"
+        self.assertEqual([], SDD.validate_agent_result(self.project, state, result))
+        state["stage"] = "apply"
+        errors = SDD.validate_agent_result(self.project, state, result)
+        self.assertTrue(any("requirement_evidence has an invalid structure" in error for error in errors))
+
+    def test_validate_agent_result_tolerates_missing_deviations_field(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "missing-deviations",
+            "Treat omitted deviations as an empty list for unattended compatibility",
+        )
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        result = {
+            "status": "completed",
+            "summary": "ok",
+            "files_read": [],
+            "files_changed": [],
+            "commands_run": [],
+            "tests": [],
+            "blocking_reason": None,
+            "task_id": None,
+            "requirement_evidence": [],
+            "residual_risks": [],
+        }
+        self.assertEqual([], SDD.validate_agent_result(self.project, state, result))
+
+    def test_validate_agent_result_tolerates_missing_blocking_reason_field(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "missing-blocking-reason",
+            "Accept omitted blocking_reason as an implicit null for compatible agents",
+        )
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        result = {
+            "status": "completed",
+            "summary": "ok",
+            "files_read": [],
+            "files_changed": [],
+            "commands_run": [],
+            "tests": [],
+            "deviations": [],
+            "task_id": None,
+            "requirement_evidence": [],
+            "residual_risks": [],
+        }
+        self.assertEqual([], SDD.validate_agent_result(self.project, state, result))
+        result["deviations"] = "none"
+        errors = SDD.validate_agent_result(self.project, state, result)
+        self.assertTrue(any("deviations must be an array of strings" in error for error in errors))
+
+    def test_validate_agent_result_for_apply_normalizes_future_requirement_evidence(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "apply-evidence-compat",
+            "Keep apply compatible with future planned evidence items while enforcing current-task evidence",
+        )
+        change_dir = self.project / "openspec" / "changes" / "apply-evidence-compat"
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [ ] 1.1 Add custom header parameter\n",
+            encoding="utf-8",
+        )
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: custom header payload, variable-length header payload\n"
+            "- Verification: compile and run existing tests\n"
+            "- Evidence: src/archive.h signature diff and existing test output\n"
+            "- Implementation Targets: src/archive.h\n"
+            "- Test Targets: tests/test_packager.cpp\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        state_path = self.project / ".sdd" / "runtime" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["stage"] = "apply"
+        state["task"] = "1.1"
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        (self.project / "src").mkdir(exist_ok=True)
+        (self.project / "src" / "archive.h").write_text("// changed\n", encoding="utf-8")
+        (self.project / "tests").mkdir(exist_ok=True)
+        (self.project / "tests" / "test_packager.cpp").write_text("// test\n", encoding="utf-8")
+        result = {
+            "status": "completed",
+            "summary": "ok",
+            "files_read": [],
+            "files_changed": ["src/archive.h"],
+            "commands_run": [],
+            "tests": [],
+            "deviations": [],
+            "blocking_reason": None,
+            "task_id": "1.1",
+            "requirement_evidence": [
+                {
+                    "requirement": "variable_length_header_payload",
+                    "implementation_files": ["src/archive.h"],
+                    "test_files": ["tests/test_packager.cpp"],
+                    "status": "satisfied",
+                    "detail": "implemented in current task",
+                },
+                {
+                    "requirement": "skill_delivery_required",
+                    "implementation_files": ["skills/unitool/SKILL.md"],
+                    "test_files": [],
+                    "status": "planned",
+                    "detail": "later task",
+                },
+            ],
+            "residual_risks": [],
+        }
+        self.assertEqual([], SDD.validate_agent_result(self.project, state, result))
 
     def test_migrate_legacy_nested_tasks_to_bounded_tasks(self) -> None:
         run("--project", str(self.project), "baseline")
@@ -1107,6 +1763,1067 @@ class RunnerSmokeTest(unittest.TestCase):
         self.assertTrue(any("commands_run" in error for error in errors))
         self.assertTrue(any("tests" in error for error in errors))
         self.assertTrue(any("requirement evidence" in error for error in errors))
+
+    def test_verify_stage_requires_competition_requirement_coverage(self) -> None:
+        change_id = "coverage-check"
+        handoff_dir = self.project / ".sdd" / "changes" / change_id / "handoffs"
+        handoff_dir.mkdir(parents=True, exist_ok=True)
+        (handoff_dir / "001-apply-to-apply.json").write_text(
+            json.dumps(
+                {
+                    "requirement_evidence": [
+                        {
+                            "requirement": "Support parameter-driven custom header payload",
+                            "implementation_files": ["src/a.cpp"],
+                            "test_files": ["tests/a.txt"],
+                            "status": "satisfied",
+                        },
+                        {
+                            "requirement": "Preserve unpack correctness",
+                            "implementation_files": ["src/b.cpp"],
+                            "test_files": ["tests/b.txt"],
+                            "status": "satisfied",
+                        },
+                    ]
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        errors = SDD.validate_competition_requirement_coverage(
+            self.project,
+            {"stage": "verify", "change_id": change_id},
+            {"requirement_evidence": []},
+        )
+        self.assertTrue(any("compatibility" in error for error in errors))
+        self.assertTrue(any("skill_delivery" in error for error in errors))
+
+    def test_verify_artifact_requires_competition_keywords(self) -> None:
+        change_id = "verify-keywords"
+        change_dir = self.project / "openspec" / "changes" / change_id
+        change_dir.mkdir(parents=True, exist_ok=True)
+        (change_dir / "verify.md").write_text(
+            "# Verification Report\n\n"
+            "## Structural Validation\n\nPASS\n\n"
+            "## Requirement Traceability\n\nPartial\n\n"
+            "## Protected API and Scope\n\nPASS\n\n"
+            "## Dependency Integrity\n\nPASS\n\n"
+            "## Quality Gates\n\nPASS\n\n"
+            "## Findings\n\nNone\n\n"
+            "## Decision\n\nPASS\n\n"
+            "## Machine State\n\n- Git commit:\n- Worktree:\n- Next action:\n",
+            encoding="utf-8",
+        )
+        errors = SDD.validate_stage_artifact(
+            self.project,
+            {"stage": "verify", "change_id": change_id},
+        )
+        self.assertTrue(any("custom_header_payload" in error for error in errors))
+        self.assertTrue(any("skill_delivery" in error for error in errors))
+
+    def test_apply_task_requires_matching_requirement_theme(self) -> None:
+        task = {
+            "id": "1.3",
+            "title": "Deliver the tool skill for THX-related handling and header inspection, and verify end-to-end behavior",
+        }
+        errors = SDD.validate_apply_task_requirement_alignment(
+            self.project,
+            {"stage": "apply"},
+            task,
+            [
+                {
+                    "requirement": "Preserve unpack correctness for customized packages",
+                    "implementation_files": ["src/a.cpp"],
+                    "test_files": ["tests/a.txt"],
+                    "status": "satisfied",
+                }
+            ],
+        )
+        self.assertTrue(any("skill_delivery" in error for error in errors))
+
+    def test_apply_task_accepts_matching_requirement_theme(self) -> None:
+        task = {
+            "id": "1.3",
+            "title": "Deliver the tool skill for THX-related handling and header inspection, and verify end-to-end behavior",
+        }
+        errors = SDD.validate_apply_task_requirement_alignment(
+            self.project,
+            {"stage": "apply"},
+            task,
+            [
+                {
+                    "requirement": "Deliver the tool skill for THX handling and header inspection",
+                    "implementation_files": ["src/a.cpp"],
+                    "test_files": ["tests/a.txt"],
+                    "status": "satisfied",
+                }
+            ],
+        )
+        self.assertEqual([], errors)
+
+    def test_apply_task_documentation_only_uses_contract_theme_instead_of_task_text(self) -> None:
+        task = {
+            "id": "1.3",
+            "title": "Deliver the tool skill for THX-related handling and header inspection, and verify end-to-end behavior",
+            "details": "Add example commands for pack with custom header, unpack, and info inspection",
+        }
+        skill = self.project / "skills" / "unitool"
+        skill.mkdir(parents=True, exist_ok=True)
+        (skill / "SKILL.md").write_text("THX header inspection with custom header examples\n", encoding="utf-8")
+        errors = SDD.validate_apply_task_requirement_alignment(
+            self.project,
+            {"stage": "apply"},
+            task,
+            [
+                {
+                    "requirement": "skill_delivery_required",
+                    "implementation_files": ["skills/unitool/SKILL.md"],
+                    "test_files": [],
+                    "status": "satisfied",
+                }
+            ],
+            {"theme": "skill delivery, THX handling, header inspection", "test_targets": "None (documentation-only change)"},
+        )
+        self.assertEqual([], errors)
+
+    def test_task_expected_themes_depend_on_title_not_legacy_task_number(self) -> None:
+        self.assertEqual(
+            ["custom_header_payload"],
+            SDD.task_expected_themes(
+                {
+                    "id": "1.2",
+                    "title": "Add file-based custom header roundtrip regression coverage",
+                }
+            ),
+        )
+        self.assertEqual(
+            ["skill_delivery"],
+            SDD.task_expected_themes(
+                {
+                    "id": "1.4",
+                    "title": "Deliver the tool skill for THX-related handling and header inspection",
+                }
+            ),
+        )
+        self.assertEqual(
+            ["custom_header_payload", "skill_delivery"],
+            SDD.task_expected_themes(
+                {
+                    "id": "1.2",
+                    "title": "Add integration test for info --json visibility of custom header",
+                    "details": "- File: `tests/integration/test_integration.cpp`",
+                }
+            ),
+        )
+
+    def test_task_declared_targets_extracts_inline_paths_from_title(self) -> None:
+        self.assertEqual(
+            ["skills/unitool/skill.md"],
+            SDD.task_declared_targets(
+                {
+                    "id": "1.5",
+                    "title": "Deliver the tool skill for THX/header inspection at skills/unitool/SKILL.md",
+                    "details": "",
+                }
+            ),
+        )
+
+    def test_apply_task_accepts_invariant_requirement_names(self) -> None:
+        task = {
+            "id": "1.1",
+            "title": "Implement parameter-driven variable-length custom header payload support with focused tests",
+        }
+        errors = SDD.validate_apply_task_requirement_alignment(
+            self.project,
+            {"stage": "apply"},
+            task,
+            [
+                {
+                    "requirement": "variable_length_header_payload",
+                    "implementation_files": ["src/a.cpp"],
+                    "test_files": ["tests/a.txt"],
+                    "status": "satisfied",
+                }
+            ],
+        )
+        self.assertEqual([], errors)
+
+    def test_apply_task_accepts_theme_from_realized_test_file_content(self) -> None:
+        task = {
+            "id": "1.4",
+            "title": "Add tests for custom header roundtrip, variable-length headers, backward compatibility, and info inspection in `tests/test_packager.cpp`",
+        }
+        target = self.project / "tests" / "test_packager.cpp"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "TEST(CustomHeader, Roundtrip) { unpack_file(archive, out); }\n"
+            "TEST(CustomHeader, DefaultCompatibility) { pack_file(input, archive); }\n",
+            encoding="utf-8",
+        )
+        errors = SDD.validate_apply_task_requirement_alignment(
+            self.project,
+            {"stage": "apply"},
+            task,
+            [
+                {
+                    "requirement": "Custom header roundtrip test",
+                    "implementation_files": ["tests/test_packager.cpp"],
+                    "test_files": ["tests/test_packager.cpp"],
+                    "status": "satisfied",
+                },
+                {
+                    "requirement": "Backward-compatible default test",
+                    "implementation_files": ["tests/test_packager.cpp"],
+                    "test_files": ["tests/test_packager.cpp"],
+                    "status": "satisfied",
+                },
+            ],
+        )
+        self.assertEqual([], errors)
+
+    def test_apply_task_accepts_backward_compatible_requirement_label(self) -> None:
+        task = {
+            "id": "1.4",
+            "title": "Add tests for custom header roundtrip, variable-length headers, backward compatibility, and info inspection in `tests/test_packager.cpp`",
+        }
+        errors = SDD.validate_apply_task_requirement_alignment(
+            self.project,
+            {"stage": "apply"},
+            task,
+            [
+                {
+                    "requirement": "Backward-compatible default test",
+                    "implementation_files": ["tests/test_packager.cpp"],
+                    "test_files": ["tests/test_packager.cpp"],
+                    "status": "satisfied",
+                },
+                {
+                    "requirement": "Custom header roundtrip test",
+                    "implementation_files": ["tests/test_packager.cpp"],
+                    "test_files": ["tests/test_packager.cpp"],
+                    "status": "satisfied",
+                },
+                {
+                    "requirement": "Variable-length header test",
+                    "implementation_files": ["tests/test_packager.cpp"],
+                    "test_files": ["tests/test_packager.cpp"],
+                    "status": "satisfied",
+                },
+                {
+                    "requirement": "Info inspection test",
+                    "implementation_files": ["tests/test_packager.cpp"],
+                    "test_files": ["tests/test_packager.cpp"],
+                    "status": "satisfied",
+                },
+            ],
+        )
+        self.assertEqual([], errors)
+
+    def test_validate_scope_ignores_apply_build_outputs(self) -> None:
+        run("--project", str(self.project), "baseline")
+        (self.project / ".sdd" / "runtime" / "state.json").write_text(
+            json.dumps(
+                {
+                    "run_id": "run-apply-build-outputs",
+                    "change_id": "apply-build-outputs",
+                    "objective": "Ignore apply build outputs",
+                    "stage": "apply",
+                    "status": "running",
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        build_dir = self.project / "build"
+        build_dir.mkdir(exist_ok=True)
+        (build_dir / "CMakeCache.txt").write_text("cache", encoding="utf-8")
+        errors = SDD.validate_scope(self.project, "apply")
+        self.assertEqual([], errors)
+
+    def test_validate_scope_ignores_verify_build_outputs(self) -> None:
+        competition = json.loads((self.project / ".sdd" / "policy" / "competition.yaml").read_text(encoding="utf-8"))
+        competition["modification"]["allowed"] = ["src/**", "tests/**", "openspec/**", ".sdd/**"]
+        (self.project / ".sdd" / "policy" / "competition.yaml").write_text(
+            json.dumps(competition, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        build_dir = self.project / "build"
+        build_dir.mkdir(exist_ok=True)
+        (build_dir / "CMakeCache.txt").write_text("cache", encoding="utf-8")
+        errors = SDD.validate_scope(self.project, "verify")
+        self.assertEqual([], errors)
+
+    def test_validate_execution_preflight_ignores_apply_build_outputs(self) -> None:
+        build_temp = self.project / "build" / "Testing" / "Temporary"
+        build_temp.mkdir(parents=True, exist_ok=True)
+        (build_temp / "LastTest.log").write_text("log", encoding="utf-8")
+        (build_temp / "CTestCostData.txt").write_text("cost", encoding="utf-8")
+        SDD.validate_execution_preflight(
+            self.project,
+            {
+                "status": "running",
+                "stage": "apply",
+                "change_id": "sample-change",
+            },
+        )
+
+    def test_validate_scope_ignores_apply_focused_build_outputs(self) -> None:
+        focused_build = self.project / ".sdd" / "tmp" / "focused-build" / "Testing" / "Temporary"
+        focused_build.mkdir(parents=True, exist_ok=True)
+        (focused_build / "LastTest.log").write_text("log", encoding="utf-8")
+        (focused_build / "CTestCostData.txt").write_text("cost", encoding="utf-8")
+        errors = SDD.validate_scope(self.project, "apply")
+        self.assertEqual([], errors)
+
+    def test_validate_scope_allows_apply_contract_targets_outside_default_source_globs(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "apply-scope-contract",
+            "Allow documentation-only skill targets during apply",
+        )
+        change_dir = self.project / "openspec" / "changes" / "apply-scope-contract"
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [ ] 1.1 Update skill documentation with THX/header inspection guidance\n",
+            encoding="utf-8",
+        )
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: skill delivery, THX handling, header inspection\n"
+            "- Verification: review the exact skill file content and confirm THX/header inspection guidance is present\n"
+            "- Evidence: updated skill file path plus content review proof for THX handling and header inspection sections\n"
+            "- Implementation Targets: skills/unitool/SKILL.md\n"
+            "- Test Targets: None (documentation-only change)\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        state_path = self.project / ".sdd" / "runtime" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["stage"] = "apply"
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        skill = self.project / "skills" / "unitool"
+        skill.mkdir(parents=True, exist_ok=True)
+        (skill / "SKILL.md").write_text("updated skill doc", encoding="utf-8")
+        errors = SDD.validate_scope(self.project, "apply")
+        self.assertFalse(any("skills/unitool/SKILL.md" in error for error in errors))
+
+    def test_focused_test_commands_allows_documentation_only_apply_task(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "doc-only-apply",
+            "Deliver documentation-only skill guidance",
+        )
+        change_dir = self.project / "openspec" / "changes" / "doc-only-apply"
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [ ] 1.1 Update skill documentation with unpack guidance\n",
+            encoding="utf-8",
+        )
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: skill delivery, THX handling, header inspection\n"
+            "- Verification: review the exact skill file content and confirm THX/header inspection guidance is present\n"
+            "- Evidence: updated skill file path plus content review proof for THX handling and header inspection sections\n"
+            "- Implementation Targets: skills/unitool/SKILL.md\n"
+            "- Test Targets: None (documentation-only change)\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        state_path = self.project / ".sdd" / "runtime" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["stage"] = "apply"
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        commands, errors = SDD.focused_test_commands(self.project, ["skills/unitool/SKILL.md"])
+        self.assertEqual([], commands)
+        self.assertEqual([], errors)
+
+    def test_focused_test_commands_allows_source_only_apply_task_without_test_file_change(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "source-only-apply",
+            "Allow narrow source-only apply work to prove behavior with existing tests",
+        )
+        change_dir = self.project / "openspec" / "changes" / "source-only-apply"
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [ ] 1.1 Update archive declaration\n",
+            encoding="utf-8",
+        )
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: custom header payload, variable-length header payload\n"
+            "- Verification: compile the project and run existing tests to confirm backward compatibility\n"
+            "- Evidence: src/archive.h signature diff plus existing test output\n"
+            "- Implementation Targets: src/archive.h\n"
+            "- Test Targets: tests/test_packager.cpp\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        state_path = self.project / ".sdd" / "runtime" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["stage"] = "apply"
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        commands, errors = SDD.focused_test_commands(self.project, ["src/archive.h"])
+        self.assertEqual([], commands)
+        self.assertEqual([], errors)
+
+    def test_focused_test_commands_generic_cpp_falls_back_to_cmake_build_dir(self) -> None:
+        project_policy = json.loads((self.project / ".sdd" / "policy" / "project.yaml").read_text(encoding="utf-8"))
+        project_policy["detected_project_kind"] = "generic"
+        (self.project / ".sdd" / "policy" / "project.yaml").write_text(
+            json.dumps(project_policy, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        (self.project / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\nproject(sample)\n", encoding="utf-8")
+        test_dir = self.project / "tests"
+        test_dir.mkdir(exist_ok=True)
+        (test_dir / "test_format.cpp").write_text("// test\n", encoding="utf-8")
+        commands, errors = SDD.focused_test_commands(self.project, ["tests/test_format.cpp"])
+        self.assertEqual([], errors)
+        self.assertEqual(
+            [
+                ["cmake", "-S", ".", "-B", ".sdd/tmp/focused-build", "-DCMAKE_BUILD_TYPE=Release"],
+                ["cmake", "--build", ".sdd/tmp/focused-build", "--config", "Release"],
+                ["ctest", "--test-dir", ".sdd/tmp/focused-build", "-C", "Release", "--output-on-failure"],
+            ],
+            commands,
+        )
+
+    def test_focused_test_commands_windows_ignores_build_sh_and_uses_cmake(self) -> None:
+        project_policy = json.loads((self.project / ".sdd" / "policy" / "project.yaml").read_text(encoding="utf-8"))
+        project_policy["detected_project_kind"] = "generic"
+        (self.project / ".sdd" / "policy" / "project.yaml").write_text(
+            json.dumps(project_policy, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        (self.project / "build.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        (self.project / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\nproject(sample)\n", encoding="utf-8")
+        test_dir = self.project / "tests"
+        test_dir.mkdir(exist_ok=True)
+        (test_dir / "test_format.cpp").write_text("// test\n", encoding="utf-8")
+        with mock.patch.object(SDD.os, "name", "nt"):
+            commands, errors = SDD.focused_test_commands(self.project, ["tests/test_format.cpp"])
+        self.assertEqual([], errors)
+        self.assertEqual(
+            [
+                ["cmake", "-S", ".", "-B", ".sdd/tmp/focused-build", "-DCMAKE_BUILD_TYPE=Release"],
+                ["cmake", "--build", ".sdd/tmp/focused-build", "--config", "Release"],
+                ["ctest", "--test-dir", ".sdd/tmp/focused-build", "-C", "Release", "--output-on-failure"],
+            ],
+            commands,
+        )
+
+    def test_focused_test_commands_python_ignores_non_python_tests(self) -> None:
+        project_policy = json.loads((self.project / ".sdd" / "policy" / "project.yaml").read_text(encoding="utf-8"))
+        project_policy["detected_project_kind"] = "python"
+        (self.project / ".sdd" / "policy" / "project.yaml").write_text(
+            json.dumps(project_policy, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        commands, errors = SDD.focused_test_commands(self.project, ["tests/unit/test_format.cpp"])
+        self.assertEqual([], commands)
+        self.assertEqual([], errors)
+
+    def test_detect_project_treats_runner_repo_shape_as_python(self) -> None:
+        package_dir = self.project / "autonomous_sdd"
+        package_dir.mkdir(parents=True, exist_ok=True)
+        (package_dir / "__init__.py").write_text("", encoding="utf-8")
+        tests_dir = self.project / "tests"
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        (tests_dir / "test_runner.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+        detected = SDD.detect_project(self.project)
+        self.assertEqual("python", detected["kind"])
+        self.assertEqual([sys.executable, "-m", "pytest"], detected["full_test"])
+        self.assertEqual([sys.executable, "-m", "compileall", "-q", "autonomous_sdd", "tests"], detected["quick_check"])
+
+    def test_target_list_ignores_contract_explanatory_text(self) -> None:
+        self.assertEqual(
+            ["scripts/sdd.py", "tests/test_cpp_detection.py"],
+            SDD.target_list(
+                "`scripts/sdd.py` (add `cpp-cmake` branch after line 1083, before generic fallback at line 1084), "
+                "`tests/test_cpp_detection.py` (new file: tests for CMakeLists.txt present, absent, and Rust-wins-over-C++ priority)"
+            ),
+        )
+
+    def test_substantive_changed_paths_keeps_skill_delivery_under_sdd(self) -> None:
+        run("--project", str(self.project), "baseline")
+        skill = self.project / ".sdd" / "skills" / "cpp-unitool-header"
+        skill.mkdir(parents=True, exist_ok=True)
+        (skill / "SKILL.md").write_text("skill delivery\n", encoding="utf-8")
+        self.assertEqual(
+            [".sdd/skills/cpp-unitool-header/SKILL.md"],
+            SDD.substantive_changed_paths(self.project),
+        )
+
+    def test_apply_result_allows_requirement_without_per_task_impl_and_test_files(self) -> None:
+        result = {
+            "status": "completed",
+            "summary": "Applied task changes and preserved broader competition constraints.",
+            "files_read": [],
+            "files_changed": ["src/main.cpp"],
+            "commands_run": [],
+            "tests": [],
+            "deviations": [],
+            "blocking_reason": None,
+            "task_id": "1.1",
+            "requirement_evidence": [
+                {
+                    "requirement": "unchanged_build_entrypoint",
+                    "implementation_files": [],
+                    "test_files": [],
+                    "status": "satisfied",
+                }
+            ],
+            "residual_risks": [],
+        }
+        errors = SDD.validate_agent_result(self.project, {"stage": "apply"}, result)
+        self.assertEqual([], errors)
+
+    def test_validate_agent_result_accepts_string_deviations(self) -> None:
+        result = {
+            "status": "completed",
+            "summary": "Applied task changes.",
+            "files_read": [],
+            "files_changed": [],
+            "commands_run": [],
+            "tests": [],
+            "deviations": "Compiler unavailable; verification deferred.",
+            "blocking_reason": None,
+            "requirement_evidence": [],
+            "residual_risks": [],
+        }
+        errors = SDD.validate_agent_result(self.project, {"stage": "review"}, result)
+        self.assertFalse(any("deviations" in error for error in errors))
+
+    def test_pre_apply_requirement_evidence_accepts_partially_satisfied_alias(self) -> None:
+        result = {
+            "status": "completed",
+            "summary": "Brainstorm complete.",
+            "files_read": [],
+            "files_changed": [],
+            "commands_run": [],
+            "tests": [],
+            "deviations": [],
+            "blocking_reason": None,
+            "task_id": None,
+            "requirement_evidence": [
+                {
+                    "requirement": "variable_length_header_payload",
+                    "implementation_files": ["src/a.cpp"],
+                    "test_files": ["tests/a.txt"],
+                    "status": "partially_satisfied",
+                }
+            ],
+            "residual_risks": [],
+        }
+        errors = SDD.validate_agent_result(self.project, {"stage": "brainstorm"}, result)
+        self.assertEqual([], errors)
+
+    def test_specs_requirement_evidence_accepts_specified_status(self) -> None:
+        result = {
+            "status": "completed",
+            "summary": "Specs complete.",
+            "files_read": [],
+            "files_changed": [],
+            "commands_run": [],
+            "tests": [],
+            "deviations": [],
+            "blocking_reason": None,
+            "task_id": None,
+            "requirement_evidence": [
+                {
+                    "requirement": "Skill documents THX binary layout",
+                    "implementation_files": [],
+                    "test_files": [],
+                    "status": "specified",
+                }
+            ],
+            "residual_risks": [],
+        }
+        errors = SDD.validate_agent_result(self.project, {"stage": "specs"}, result)
+        self.assertEqual([], errors)
+
+    def test_design_requirement_evidence_accepts_designed_status(self) -> None:
+        result = {
+            "status": "completed",
+            "summary": "Design complete.",
+            "files_read": [],
+            "files_changed": [],
+            "commands_run": [],
+            "tests": [],
+            "deviations": [],
+            "blocking_reason": None,
+            "task_id": None,
+            "requirement_evidence": [
+                {
+                    "requirement": "Support custom header payload content through a parameter",
+                    "implementation_files": ["src/archive.h"],
+                    "test_files": ["tests/test_packager.cpp"],
+                    "status": "designed",
+                }
+            ],
+            "residual_risks": [],
+        }
+        errors = SDD.validate_agent_result(self.project, {"stage": "design"}, result)
+        self.assertEqual([], errors)
+
+    def test_brainstorm_requirement_evidence_accepts_complete_suffix_alias(self) -> None:
+        result = {
+            "status": "completed",
+            "summary": "Brainstorm complete.",
+            "files_read": [],
+            "files_changed": [],
+            "commands_run": [],
+            "tests": [],
+            "deviations": [],
+            "blocking_reason": None,
+            "task_id": None,
+            "requirement_evidence": [
+                {
+                    "requirement": "Support custom header payload content through a parameter",
+                    "implementation_files": [],
+                    "test_files": [],
+                    "status": "design_complete",
+                }
+            ],
+            "residual_risks": [],
+        }
+        errors = SDD.validate_agent_result(self.project, {"stage": "brainstorm"}, result)
+        self.assertEqual([], errors)
+
+    def test_proposal_requirement_evidence_accepts_optional_note(self) -> None:
+        result = {
+            "status": "completed",
+            "summary": "Proposal complete.",
+            "files_read": [],
+            "files_changed": [],
+            "commands_run": [],
+            "tests": [],
+            "deviations": [],
+            "blocking_reason": None,
+            "task_id": None,
+            "requirement_evidence": [
+                {
+                    "requirement": "variable_length_header_payload",
+                    "implementation_files": [],
+                    "test_files": [],
+                    "status": "satisfied",
+                    "note": "Proposal maps this invariant to a header_content parameter and serialized header size.",
+                }
+            ],
+            "residual_risks": [],
+        }
+        errors = SDD.validate_agent_result(self.project, {"stage": "proposal"}, result)
+        self.assertEqual([], errors)
+
+    def test_plan_contracts_require_all_tasks_and_required_fields(self) -> None:
+        change_id = "plan-contracts"
+        change_dir = self.project / "openspec" / "changes" / change_id
+        change_dir.mkdir(parents=True, exist_ok=True)
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [ ] 1.1 Implement parameter-driven variable-length custom header payload support with focused tests\n"
+            "- [ ] 1.2 Preserve unpack correctness, original CLI compatibility, and unchanged build entrypoint with regression tests\n"
+            "- [ ] 1.3 Deliver the tool skill for THX-related handling and header inspection, and verify end-to-end behavior\n",
+            encoding="utf-8",
+        )
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: custom header payload and variable-length header handling\n"
+            "- Verification: focused custom-header pack checks\n"
+            "- Evidence: diff and focused test logs\n\n"
+            "- Implementation Targets: src/pack, src/header\n"
+            "- Test Targets: tests/header, tests/pack\n\n"
+            "### Task 1.2\n\n"
+            "- Theme: unpack correctness, legacy cli compatibility, build entrypoint stability\n"
+            "- Verification: unpack and compatibility regression checks\n"
+            "- Evidence: unpack logs and compatibility logs\n\n"
+            "- Implementation Targets: src/unpack, src/cli\n"
+            "- Test Targets: tests/unpack, tests/compatibility\n\n"
+            "### Task 1.3\n\n"
+            "- Theme: skill delivery, thx handling, header inspection\n"
+            "- Verification: skill invocation and end-to-end checks\n"
+            "- Evidence: skill files and invocation logs\n"
+            "- Implementation Targets: skill/cpp-unitool-header, src/inspection\n"
+            "- Test Targets: tests/skill, tests/inspection\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        errors = SDD.validate_plan_contracts(
+            self.project,
+            {"stage": "plan", "change_id": change_id},
+        )
+        self.assertEqual([], errors)
+
+    def test_plan_contracts_reject_missing_task_mapping_and_fields(self) -> None:
+        change_id = "plan-contracts-fail"
+        change_dir = self.project / "openspec" / "changes" / change_id
+        change_dir.mkdir(parents=True, exist_ok=True)
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [ ] 1.1 Implement parameter-driven variable-length custom header payload support with focused tests\n"
+            "- [ ] 1.2 Preserve unpack correctness, original CLI compatibility, and unchanged build entrypoint with regression tests\n",
+            encoding="utf-8",
+        )
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: custom header payload\n"
+            "- Verification: focused checks\n\n"
+            "- Implementation Targets: src/pack\n"
+            "- Test Targets: tests/header\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        errors = SDD.validate_plan_contracts(
+            self.project,
+            {"stage": "plan", "change_id": change_id},
+        )
+        self.assertTrue(any("1.1 missing evidence" in error for error in errors))
+        self.assertTrue(any("missing contract block for task 1.2" in error for error in errors))
+
+    def test_plan_contracts_reject_generic_verification_and_evidence(self) -> None:
+        change_id = "plan-generic"
+        change_dir = self.project / "openspec" / "changes" / change_id
+        change_dir.mkdir(parents=True, exist_ok=True)
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [ ] 1.1 Implement parameter-driven variable-length custom header payload support with focused tests\n",
+            encoding="utf-8",
+        )
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: custom header payload and variable-length header handling\n"
+            "- Verification: run tests\n"
+            "- Evidence: collect logs\n"
+            "- Implementation Targets: src/pack, src/header\n"
+            "- Test Targets: tests/header, tests/pack\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        errors = SDD.validate_plan_contracts(
+            self.project,
+            {"stage": "plan", "change_id": change_id},
+        )
+        self.assertTrue(any("verification is too generic" in error for error in errors))
+        self.assertTrue(any("evidence is too generic" in error for error in errors))
+
+    def test_plan_contract_specificity_helpers_accept_concrete_lines(self) -> None:
+        self.assertTrue(
+            SDD.verification_line_is_specific(
+                "run customized unpack regression and original CLI compatibility checks"
+            )
+        )
+        self.assertTrue(
+            SDD.evidence_line_is_specific(
+                "unpack test logs, compatibility output, and build-entry stability proof"
+            )
+        )
+        self.assertTrue(
+            SDD.verification_line_is_specific(
+                "Run `test_format` binary; all existing + new tests pass; exit code 0"
+            )
+        )
+        self.assertTrue(
+            SDD.evidence_line_is_specific(
+                "New test functions `test_write_read_hwx_custom_header_empty` in `tests/unit/test_format.cpp`"
+            )
+        )
+        self.assertTrue(
+            SDD.target_line_is_specific(
+                "`tests/unit/test_format.cpp` — add 4 static test functions using existing assert pattern"
+            )
+        )
+        self.assertTrue(SDD.target_line_is_specific("None (documentation-only change)"))
+
+    def test_plan_commitment_coverage_rejects_unrealized_theme(self) -> None:
+        change_id = "plan-coverage-fail"
+        change_dir = self.project / "openspec" / "changes" / change_id
+        handoff_dir = self.project / ".sdd" / "changes" / change_id / "handoffs"
+        change_dir.mkdir(parents=True, exist_ok=True)
+        handoff_dir.mkdir(parents=True, exist_ok=True)
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.3\n\n"
+            "- Theme: skill delivery, thx handling, header inspection\n"
+            "- Verification: run skill invocation and header inspection verification\n"
+            "- Evidence: skill files and header inspection output\n"
+            "- Implementation Targets: skill/cpp-unitool-header, src/inspection\n"
+            "- Test Targets: tests/skill, tests/inspection\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        (handoff_dir / "001-apply-to-apply.json").write_text(
+            json.dumps(
+                {
+                    "requirement_evidence": [
+                        {
+                            "requirement": "Preserve unpack correctness for customized packages",
+                            "implementation_files": ["src/unpack/a.cpp"],
+                            "test_files": ["tests/unpack/a.txt"],
+                            "status": "satisfied",
+                        }
+                    ]
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        errors = SDD.validate_plan_commitment_coverage(
+            self.project,
+            {"stage": "verify", "change_id": change_id},
+            {"requirement_evidence": []},
+        )
+        self.assertTrue(any("verification has no realized evidence for theme: skill_delivery" in error for error in errors))
+
+    def test_plan_commitment_coverage_accepts_realized_theme(self) -> None:
+        change_id = "plan-coverage-pass"
+        change_dir = self.project / "openspec" / "changes" / change_id
+        handoff_dir = self.project / ".sdd" / "changes" / change_id / "handoffs"
+        change_dir.mkdir(parents=True, exist_ok=True)
+        handoff_dir.mkdir(parents=True, exist_ok=True)
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.3\n\n"
+            "- Theme: skill delivery, thx handling, header inspection\n"
+            "- Verification: run skill invocation and header inspection verification\n"
+            "- Evidence: skill files and header inspection output\n"
+            "- Implementation Targets: skill/cpp-unitool-header, src/inspection\n"
+            "- Test Targets: tests/skill, tests/inspection\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        (handoff_dir / "001-apply-to-apply.json").write_text(
+            json.dumps(
+                {
+                    "requirement_evidence": [
+                        {
+                            "requirement": "Deliver the tool skill for THX handling and header inspection",
+                            "implementation_files": ["skill/cpp-unitool-header/SKILL.md"],
+                            "test_files": ["tests/skill/header_skill_test.txt"],
+                            "status": "satisfied",
+                        }
+                    ]
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        errors = SDD.validate_plan_commitment_coverage(
+            self.project,
+            {"stage": "verify", "change_id": change_id},
+            {"requirement_evidence": []},
+        )
+        self.assertEqual([], errors)
+
+    def test_plan_contracts_reject_generic_targets(self) -> None:
+        change_id = "plan-targets-generic"
+        change_dir = self.project / "openspec" / "changes" / change_id
+        change_dir.mkdir(parents=True, exist_ok=True)
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [ ] 1.1 Implement parameter-driven variable-length custom header payload support with focused tests\n",
+            encoding="utf-8",
+        )
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: custom header payload and variable-length header handling\n"
+            "- Verification: run focused custom-header pack checks\n"
+            "- Evidence: header-related validation logs and diff output\n"
+            "- Implementation Targets: src\n"
+            "- Test Targets: tests\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        errors = SDD.validate_plan_contracts(
+            self.project,
+            {"stage": "plan", "change_id": change_id},
+        )
+        self.assertTrue(any("implementation_targets is too generic" in error for error in errors))
+        self.assertTrue(any("test_targets is too generic" in error for error in errors))
+
+    def test_plan_contracts_accept_realistic_concrete_plan_from_live_run_shape(self) -> None:
+        change_id = "plan-live-shape"
+        change_dir = self.project / "openspec" / "changes" / change_id
+        change_dir.mkdir(parents=True, exist_ok=True)
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [ ] 1.1 Add unit tests for variable-length custom_header payloads through binary write/read roundtrip\n"
+            "- [ ] 1.2 Add integration tests for unpack correctness, backward compatibility, and info output with custom header\n"
+            "- [ ] 1.3 Update skill with THX header inspection guidance\n",
+            encoding="utf-8",
+        )
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: Add unit tests for variable-length custom_header payloads through binary write/read roundtrip\n"
+            "- Verification: Run `test_format` binary; all existing + new tests pass; exit code 0\n"
+            "- Evidence: New test functions `test_write_read_hwx_custom_header_empty` in `tests/unit/test_format.cpp`\n"
+            "- Implementation Targets: `tests/unit/test_format.cpp` — add 4 static test functions\n"
+            "- Test Targets: `tests/unit/test_format.cpp` — each function exercises `write_hwx`/`read_hwx` roundtrip\n\n"
+            "### Task 1.2\n\n"
+            "- Theme: Add integration tests for unpack correctness, backward compatibility, and info output with custom header\n"
+            "- Verification: Run `test_integration` binary; all existing + new tests pass; exit code 0\n"
+            "- Evidence: New test functions `test_unpack_with_custom_header` in `tests/integration/test_integration.cpp`\n"
+            "- Implementation Targets: `tests/integration/test_integration.cpp` — add 3 static test functions\n"
+            "- Test Targets: `tests/integration/test_integration.cpp` — verify pack/unpack and info output with `custom_header`\n\n"
+            "### Task 1.3\n\n"
+            "- Theme: Update skill with THX header inspection guidance\n"
+            "- Verification: `skills/unitool/SKILL.md` content review; THX inspection and custom_header guidance present\n"
+            "- Evidence: Updated `skills/unitool/SKILL.md` with THX/header inspection subsections\n"
+            "- Implementation Targets: `skills/unitool/SKILL.md` — add THX guidance and examples\n"
+            "- Test Targets: None (documentation-only change)\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        errors = SDD.validate_plan_contracts(
+            self.project,
+            {"stage": "plan", "change_id": change_id},
+        )
+        self.assertEqual([], errors)
+
+    def test_plan_contracts_accept_aggregated_contracts_for_related_tasks(self) -> None:
+        change_id = "plan-aggregated"
+        change_dir = self.project / "openspec" / "changes" / change_id
+        change_dir.mkdir(parents=True, exist_ok=True)
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n"
+            "- [ ] 1.1 Add unit tests for variable-length custom header payload at boundaries\n"
+            "  - File: `tests/unit/test_format.cpp`\n\n"
+            "- [ ] 1.2 Add integration test for info --json visibility of custom header\n"
+            "  - File: `tests/integration/test_integration.cpp`\n\n"
+            "- [ ] 1.3 Add CLI integration test for info --json on packed archive\n"
+            "  - File: `tests/integration/test_cli.cpp`\n\n"
+            "- [ ] 1.4 Enhance skill documentation with THX header inspection workflow\n"
+            "  - File: `skills/unitool/SKILL.md`\n\n"
+            "- [ ] 1.5 Verify all existing tests pass unchanged\n",
+            encoding="utf-8",
+        )
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: custom header payload, variable-length header payload\n"
+            "- Verification: run the specific custom-header regression binary or command and confirm the targeted custom_header roundtrip behavior passes with exit code 0\n"
+            "- Evidence: focused test output plus the exact changed test file paths that prove custom_header roundtrip and variable-length payload coverage\n"
+            "- Implementation Targets: tests/unit/test_format.cpp\n"
+            "- Test Targets: tests/unit/test_format.cpp\n\n"
+            "### Task 1.2\n\n"
+            "- Theme: unpack correctness, legacy CLI compatibility, unchanged build entrypoint\n"
+            "- Verification: run the exact unpack and CLI regression targets and confirm customized unpack, original CLI behavior, and build entry stability all pass\n"
+            "- Evidence: unpack regression output, CLI regression output, and file-level proof tied to the changed integration test paths\n"
+            "- Implementation Targets: tests/integration/test_integration.cpp, tests/integration/test_cli.cpp\n"
+            "- Test Targets: tests/integration/test_integration.cpp, tests/integration/test_cli.cpp\n\n"
+            "### Task 1.3\n\n"
+            "- Theme: skill delivery, THX handling, header inspection\n"
+            "- Verification: review the exact skill file content and confirm THX/header inspection guidance, custom_header behavior, and usage examples are present\n"
+            "- Evidence: updated skill file path plus content review proof for THX handling and header inspection sections\n"
+            "- Implementation Targets: skills/unitool/SKILL.md\n"
+            "- Test Targets: None (documentation-only change)\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        errors = SDD.validate_plan_contracts(
+            self.project,
+            {"stage": "plan", "change_id": change_id},
+        )
+        self.assertEqual([], errors)
+
+    def test_plan_commitment_coverage_rejects_unmatched_declared_targets(self) -> None:
+        change_id = "plan-target-match-fail"
+        change_dir = self.project / "openspec" / "changes" / change_id
+        handoff_dir = self.project / ".sdd" / "changes" / change_id / "handoffs"
+        change_dir.mkdir(parents=True, exist_ok=True)
+        handoff_dir.mkdir(parents=True, exist_ok=True)
+        (change_dir / "plan.md").write_text(
+            "# Execution Plan\n\n"
+            "## Execution Strategy\n\nScoped per task.\n\n"
+            "## Tasks\n\n"
+            "### Task 1.1\n\n"
+            "- Theme: custom header payload and variable-length header handling\n"
+            "- Verification: run focused custom-header pack checks and variable-length payload regression\n"
+            "- Evidence: implementation diff, focused test output, and header-related validation logs\n"
+            "- Implementation Targets: src/pack, src/header\n"
+            "- Test Targets: tests/header, tests/pack\n\n"
+            "## Verification\n\ncovered\n\n"
+            "## Checkpoint Strategy\n\ncheckpoint\n",
+            encoding="utf-8",
+        )
+        (handoff_dir / "001-apply-to-apply.json").write_text(
+            json.dumps(
+                {
+                    "requirement_evidence": [
+                        {
+                            "requirement": "Support parameter-driven custom header payload with variable-length header content",
+                            "implementation_files": ["src/cli/a.cpp"],
+                            "test_files": ["tests/cli/a.txt"],
+                            "status": "satisfied",
+                        }
+                    ]
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        errors = SDD.validate_plan_commitment_coverage(
+            self.project,
+            {"stage": "verify", "change_id": change_id},
+            {"requirement_evidence": []},
+        )
+        self.assertTrue(any("implementation_targets have no realized file match" in error for error in errors))
+        self.assertTrue(any("test_targets have no realized file match" in error for error in errors))
 
     def test_maven_focused_test_is_derived_from_changed_test_files(self) -> None:
         project_policy = self.project / ".sdd" / "policy" / "project.yaml"

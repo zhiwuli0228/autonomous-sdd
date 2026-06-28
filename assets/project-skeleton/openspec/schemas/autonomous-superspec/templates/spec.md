@@ -1,15 +1,24 @@
 ## ADDED Requirements
 
-### Requirement: Descriptive requirement name
+### Requirement: Support parameter-driven custom header payload
 
-The system MUST provide one observable behavior.
+The system MUST support a parameter that injects custom header payload content into the generated package.
 
-#### Scenario: Observable success case
+#### Scenario: Variable-length custom payload is packed successfully
 
-- **WHEN** a defined precondition occurs
-- **THEN** the expected observable result occurs
+- **WHEN** the caller provides supported custom payload content with non-fixed length
+- **THEN** the package contains that payload and remains structurally valid
 
-#### Scenario: Observable failure or boundary case
+### Requirement: Preserve unpack correctness and compatibility
 
-- **WHEN** a defined invalid or boundary input occurs
-- **THEN** the required failure semantics are observable
+The system MUST preserve unpack behavior and legacy invocation compatibility after the customization.
+
+#### Scenario: Customized package unpacks successfully
+
+- **WHEN** a package contains custom header payload content
+- **THEN** unpack restores the packaged content correctly
+
+#### Scenario: Legacy invocation remains compatible
+
+- **WHEN** the original tool parameters are used without the new customization parameter
+- **THEN** behavior remains compatible with the legacy contract

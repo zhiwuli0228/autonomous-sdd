@@ -20,6 +20,8 @@ from autonomous_sdd.repository import Repository
 from autonomous_sdd.services import create_runtime_services
 from autonomous_sdd.workspace import RunWorkspace, create_run_context
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 def git(root: Path, *args: str) -> str:
     result = subprocess.run(
@@ -239,6 +241,10 @@ class InfrastructureTest(unittest.TestCase):
             build_effective_runtime({"budget": {"maximum_agent_invocations": True}})
         with self.assertRaises(ConfigurationError):
             build_effective_runtime({"timeouts": {"agent_seconds": 1}})
+        with self.assertRaises(ConfigurationError):
+            build_effective_runtime({"timeouts": {"stage_agent_seconds": []}})
+        with self.assertRaises(ConfigurationError):
+            build_effective_runtime({"timeouts": {"stage_agent_seconds": {"specs": 1}}})
 
     def test_policy_cannot_relax_agent_safety_invariants(self) -> None:
         unsafe_overrides = [
@@ -267,6 +273,24 @@ class InfrastructureTest(unittest.TestCase):
             build_effective_runtime(policy_override={"changes": {"maximum_changed_files": 51}})
         with self.assertRaises(ConfigurationError):
             build_effective_runtime({"git": {"auto_commit": False}})
+
+    def test_project_skeleton_stage_timeouts_are_open_enough_for_weaker_agents(self) -> None:
+        config = json.loads((ROOT / "assets" / "project-skeleton" / ".sdd" / "config.yaml").read_text(encoding="utf-8"))
+        stage_timeouts = config["timeouts"]["stage_agent_seconds"]
+        self.assertEqual(600, stage_timeouts["brainstorm"])
+        self.assertEqual(1200, stage_timeouts["proposal"])
+        self.assertEqual(1800, stage_timeouts["specs"])
+        self.assertEqual(2400, stage_timeouts["design"])
+        self.assertEqual(1200, stage_timeouts["tasks"])
+        self.assertEqual(1200, stage_timeouts["plan"])
+        self.assertEqual(2400, stage_timeouts["apply"])
+        self.assertEqual(1800, stage_timeouts["review"])
+        self.assertEqual(1800, stage_timeouts["verify"])
+        self.assertEqual(600, stage_timeouts["finalize"])
+        self.assertEqual(300, stage_timeouts["archive"])
+        self.assertEqual(600, stage_timeouts["retrospective"])
+        self.assertEqual(1, config["budget"]["maximum_stage_retries"])
+        self.assertEqual(4, config["budget"]["maximum_repeated_failure_signatures"])
 
     def test_policy_allows_stricter_change_limits(self) -> None:
         runtime = build_effective_runtime(
