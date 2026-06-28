@@ -1,4 +1,4 @@
-# Autonomous Competition Delivery
+# Hosted Autonomous SDD
 
 This repository is controlled by `.sdd/runtime/state.json`.
 

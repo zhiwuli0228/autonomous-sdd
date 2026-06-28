@@ -3,6 +3,13 @@
   "distribution_version": "0.3.0",
   "model": null,
   "executor": "opencode",
+  "skill_routing": {
+    "capabilities": {
+      "coding": [],
+      "review": [],
+      "verification": []
+    }
+  },
   "git": {
     "auto_commit": true
   },

@@ -56,6 +56,33 @@ class RunnerSmokeTest(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.temp, ignore_errors=True)
 
+    def test_initialized_project_contains_self_hosted_agent_runtime(self) -> None:
+        self.assertTrue((self.project / ".opencode" / "agents" / "autonomous-sdd.md").is_file())
+        self.assertTrue((self.project / ".opencode" / "agents" / "sdd-stage.md").is_file())
+        self.assertFalse((self.project / ".opencode" / "skills" / "autonomous-sdd" / "SKILL.md").exists())
+        self.assertFalse((self.project / ".sdd" / "skills" / "cpp-unitool-header" / "SKILL.md").exists())
+        copied_runner = self.project / ".sdd" / "bin" / "sdd.py"
+        result = subprocess.run(
+            [sys.executable, str(copied_runner), "--version"],
+            cwd=self.project,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        self.assertEqual(0, result.returncode, result.stdout)
+        self.assertIn(SDD.VERSION, result.stdout)
+
+    def test_force_init_removes_legacy_bundled_skills(self) -> None:
+        legacy_host = self.project / ".opencode" / "skills" / "autonomous-sdd"
+        legacy_domain = self.project / ".sdd" / "skills" / "cpp-unitool-header"
+        legacy_host.mkdir(parents=True, exist_ok=True)
+        legacy_domain.mkdir(parents=True, exist_ok=True)
+        (legacy_host / "SKILL.md").write_text("legacy host skill\n", encoding="utf-8")
+        (legacy_domain / "SKILL.md").write_text("legacy domain skill\n", encoding="utf-8")
+        SDD.init_project(argparse.Namespace(project=str(self.project), force=True))
+        self.assertFalse(legacy_host.exists())
+        self.assertFalse(legacy_domain.exists())
+
     def test_init_baseline_start_and_packet(self) -> None:
         run("--project", str(self.project), "baseline")
         run(
@@ -67,8 +94,17 @@ class RunnerSmokeTest(unittest.TestCase):
         )
         output = run("--project", str(self.project), "run-once", "--dry-run").stdout
         packet = json.loads(output)
+        self.assertEqual(2, packet["packet_contract_version"])
         self.assertEqual("brainstorm", packet["stage"])
         self.assertEqual("sample-change", packet["change_id"])
+        self.assertIn("context_summary", packet)
+        self.assertIn("required_artifacts", packet)
+        self.assertIn("metadata", packet)
+        self.assertEqual("competition-cpp-header-payload", packet["metadata"]["scenario_profile"])
+        self.assertEqual("competition-cpp-header-payload", packet["scenario_profile"])
+        self.assertIn("scenario_constraints", packet)
+        self.assertIn("required_outcomes", packet)
+        self.assertIn("scenario_tooling_constraints", packet)
         self.assertIn("frozen_goal", packet)
         self.assertIn("competition_constraints", packet)
         self.assertIn("required_acceptance_invariants", packet)
@@ -76,10 +112,18 @@ class RunnerSmokeTest(unittest.TestCase):
         state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
         self.assertEqual("opencode-default", state["model_selection"])
         self.assertEqual("inline", state["objective_source"])
+        self.assertEqual("inline", state["scenario_objective_source"])
+        self.assertEqual("competition-cpp-header-payload", state["scenario_profile"])
+        self.assertEqual(state["scenario_constraints"], state["competition_constraints"])
+        self.assertEqual(state["required_outcomes"], state["required_acceptance_invariants"])
         objective_bundle = json.loads(
-            (self.project / ".sdd" / "runtime" / "competition-objective.json").read_text(encoding="utf-8")
+            (self.project / ".sdd" / "runtime" / "scenario-objective.json").read_text(encoding="utf-8")
         )
         self.assertEqual("inline", objective_bundle["source"])
+        legacy_objective_bundle = json.loads(
+            (self.project / ".sdd" / "runtime" / "competition-objective.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(objective_bundle, legacy_objective_bundle)
 
     def test_resolve_competition_objective_defaults_to_frozen_cpp_goal(self) -> None:
         bundle = SDD.resolve_competition_objective(None, self.project)
@@ -88,6 +132,45 @@ class RunnerSmokeTest(unittest.TestCase):
         self.assertEqual(SDD.DEFAULT_COMPETITION_GOAL, bundle["effective_objective"])
         self.assertIn("Unpack must still work correctly after customization.", bundle["competition_constraints"])
         self.assertIn("skill_delivery_required", bundle["required_acceptance_invariants"])
+
+    def test_start_selects_generic_hosted_profile(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "generic-change",
+            "Implement a bounded generic behavior with focused verification evidence",
+            "--profile",
+            "generic-hosted",
+        )
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual("generic-hosted", state["scenario_profile"])
+        self.assertIn("Preserve existing public behavior unless the task explicitly changes it.", state["scenario_constraints"])
+        packet = json.loads(run("--project", str(self.project), "run-once", "--dry-run").stdout)
+        self.assertEqual("generic-hosted", packet["scenario_profile"])
+        self.assertEqual("generic-hosted", packet["metadata"]["scenario_profile"])
+
+    def test_compete_selects_generic_hosted_default_objective(self) -> None:
+        run("--project", str(self.project), "baseline")
+        with (
+            mock.patch.object(SDD, "run_loop") as run_loop,
+            mock.patch.object(SDD, "finalize_competition_run", return_value={"status": "closed"}),
+        ):
+            SDD.compete(
+                argparse.Namespace(
+                    project=str(self.project),
+                    task=None,
+                    change_id="generic-default",
+                    executor="fixture",
+                    max_steps=1,
+                    scenario_profile="generic-hosted",
+                )
+            )
+        active_root = Path(run_loop.call_args.args[0].project)
+        state = json.loads((active_root / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual("generic-hosted", state["scenario_profile"])
+        self.assertEqual(SDD.get_profile("generic-hosted").default_objective, state["objective"])
 
     def test_compete_allows_missing_task_and_uses_default_objective(self) -> None:
         run("--project", str(self.project), "baseline")
@@ -110,6 +193,8 @@ class RunnerSmokeTest(unittest.TestCase):
         state = json.loads((active_root / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(SDD.DEFAULT_COMPETITION_GOAL, state["objective"])
         self.assertEqual("default", state["objective_source"])
+        self.assertEqual("default", state["scenario_objective_source"])
+        self.assertEqual("competition-cpp-header-payload", state["scenario_profile"])
 
     def test_apply_packet_includes_current_task_contract(self) -> None:
         run("--project", str(self.project), "baseline")
@@ -145,7 +230,11 @@ class RunnerSmokeTest(unittest.TestCase):
         state["stage"] = "apply"
         state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
         packet = json.loads(run("--project", str(self.project), "run-once", "--dry-run").stdout)
+        self.assertEqual(2, packet["packet_contract_version"])
         self.assertEqual("1.1", packet["task_id"])
+        self.assertTrue(any(item["name"] == "coding-skill" for item in packet["skill_requirements"]))
+        coding_requirement = next(item for item in packet["skill_requirements"] if item["capability"] == "coding")
+        self.assertEqual(["coding-skill"], coding_requirement["candidates"])
         self.assertIn("current_task_contract", packet)
         self.assertEqual(
             "src/pack, src/header",
@@ -156,6 +245,35 @@ class RunnerSmokeTest(unittest.TestCase):
             packet["current_task_contract"]["test_targets"],
         )
         self.assertNotIn("openspec/changes/packet-contract/tasks.md", packet["allowed_paths"])
+
+    def test_project_skill_routing_overrides_profile_candidates(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "project-skill-routing",
+            "Implement a bounded behavior using project-provided coding standards",
+            "--profile",
+            "generic-hosted",
+        )
+        config_path = self.project / ".sdd" / "config.yaml"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["skill_routing"]["capabilities"]["coding"] = ["project-coder", "company-coder"]
+        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        state_path = self.project / ".sdd" / "runtime" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["stage"] = "apply"
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        change_dir = self.project / "openspec" / "changes" / "project-skill-routing"
+        (change_dir / "tasks.md").write_text(
+            "# Tasks\n\n## 1. Implementation\n\n- [ ] 1.1 Apply the bounded behavior\n",
+            encoding="utf-8",
+        )
+        packet = SDD.build_packet(self.project, state)
+        coding = next(item for item in packet["skill_requirements"] if item["capability"] == "coding")
+        self.assertEqual(["project-coder", "company-coder"], coding["candidates"])
+        self.assertEqual("project-coder", coding["name"])
 
     def test_apply_packet_synthesizes_contract_from_tasks_when_plan_contract_is_missing(self) -> None:
         run("--project", str(self.project), "baseline")
@@ -195,6 +313,7 @@ class RunnerSmokeTest(unittest.TestCase):
         state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
         packet = json.loads(run("--project", str(self.project), "run-once", "--dry-run").stdout)
         self.assertEqual("1.7", packet["task_id"])
+        self.assertIn("required_artifacts", packet)
         self.assertEqual("skills/unitool/SKILL.md", packet["current_task_contract"]["implementation_targets"])
         self.assertEqual("None (documentation-only change)", packet["current_task_contract"]["test_targets"])
         self.assertEqual("synthesized", packet["current_task_contract"]["_source"])
@@ -939,7 +1058,8 @@ class RunnerSmokeTest(unittest.TestCase):
         )
         self.assertIn("RESULT=CLOSED", result.stdout)
         payload = json.loads(result.stdout.strip().splitlines()[-1])
-        self.assertEqual("competition_result", payload["kind"])
+        self.assertEqual("hosted_sdd_result", payload["kind"])
+        self.assertEqual("competition_result", payload["legacy_kind"])
         self.assertEqual("closed", payload["status"])
         self.assertEqual("completed", payload["decision"])
         self.assertEqual("none", payload["recommended_action"])
@@ -984,7 +1104,8 @@ class RunnerSmokeTest(unittest.TestCase):
         )
         self.assertIn("RESULT=CLOSED", result.stdout)
         payload = json.loads(result.stdout.strip().splitlines()[-1])
-        self.assertEqual("competition_result", payload["kind"])
+        self.assertEqual("hosted_sdd_result", payload["kind"])
+        self.assertEqual("competition_result", payload["legacy_kind"])
         self.assertEqual("closed", payload["status"])
         self.assertEqual("completed", payload["decision"])
         self.assertEqual(0, payload["exit_code"])
@@ -1019,7 +1140,8 @@ class RunnerSmokeTest(unittest.TestCase):
         )
         self.assertIn("RESULT=CLOSED", result.stdout)
         payload = json.loads(result.stdout.strip().splitlines()[-1])
-        self.assertEqual("competition_result", payload["kind"])
+        self.assertEqual("hosted_sdd_result", payload["kind"])
+        self.assertEqual("competition_result", payload["legacy_kind"])
         self.assertEqual("closed", payload["status"])
         self.assertEqual("completed", payload["decision"])
         self.assertEqual(0, payload["exit_code"])
@@ -1064,7 +1186,8 @@ class RunnerSmokeTest(unittest.TestCase):
         )
         self.assertIn("RESULT=CLOSED", result.stdout)
         payload = json.loads(result.stdout.strip().splitlines()[-1])
-        self.assertEqual("competition_result", payload["kind"])
+        self.assertEqual("hosted_sdd_result", payload["kind"])
+        self.assertEqual("competition_result", payload["legacy_kind"])
         self.assertEqual("closed", payload["status"])
         self.assertEqual("completed", payload["decision"])
         self.assertEqual(0, payload["exit_code"])
@@ -1138,7 +1261,8 @@ class RunnerSmokeTest(unittest.TestCase):
         )
         self.assertIn("Injected deterministic failure at stage proposal", result.stdout)
         payload = json.loads(result.stdout.strip().splitlines()[-1])
-        self.assertEqual("competition_result", payload["kind"])
+        self.assertEqual("hosted_sdd_result", payload["kind"])
+        self.assertEqual("competition_result", payload["legacy_kind"])
         self.assertEqual("closed", payload["status"])
         self.assertEqual("closed_partial", payload["outcome"])
         self.assertEqual("completed_partial", payload["decision"])
@@ -1319,6 +1443,24 @@ class RunnerSmokeTest(unittest.TestCase):
         journal = (self.project / ".sdd" / "runtime" / "execution-journal.jsonl").read_text(encoding="utf-8")
         self.assertIn('"event": "agent_timed_out"', journal)
         self.assertIn('"stage": "specs"', journal)
+
+    def test_invoke_agent_selects_bounded_stage_agent(self) -> None:
+        run("--project", str(self.project), "baseline")
+        run(
+            "--project",
+            str(self.project),
+            "start",
+            "agent-selection",
+            "Ensure every hosted stage uses the bounded OpenCode stage agent",
+        )
+        state = json.loads((self.project / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
+        completed = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+        with mock.patch.object(SDD, "run_command", return_value=completed) as execute:
+            SDD.invoke_agent(self.project, state, False)
+        command = execute.call_args.args[0]
+        self.assertEqual("opencode", command[0])
+        self.assertIn("--agent", command)
+        self.assertEqual(SDD.STAGE_AGENT_NAME, command[command.index("--agent") + 1])
 
     def test_run_loop_force_closes_after_repeated_failure_signature_budget(self) -> None:
         run("--project", str(self.project), "baseline")

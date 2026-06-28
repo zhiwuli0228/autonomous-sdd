@@ -36,80 +36,32 @@ def _add_repo_root_to_sys_path() -> None:
 
 _add_repo_root_to_sys_path()
 
-from autonomous_sdd import create_runtime_services
+from autonomous_sdd import StageAgentPacket, create_runtime_services
+from autonomous_sdd.profiles import (
+    COMPETITION_PROFILE,
+    get_profile,
+    normalize_profile_text,
+    registered_profiles,
+    resolve_profile_objective,
+    stage_skill_requirements as profile_stage_skill_requirements,
+    task_expected_themes as profile_task_expected_themes,
+    theme_markers,
+    themes_from_text as profile_themes_from_text,
+    validate_requirement_coverage,
+)
 from autonomous_sdd.repository import Repository
 
 
 VERSION = "0.3.0"
+STAGE_AGENT_NAME = "sdd-stage"
 MIN_APPLY_TASKS = 3
 MAX_APPLY_TASKS = 20
-DEFAULT_COMPETITION_GOAL = (
-    "Modify the target C++ packaging project to support custom header payload content provided by a parameter "
-    "while preserving unpack correctness, build entry compatibility, original CLI compatibility, skill delivery, "
-    "and verification completeness."
-)
-DEFAULT_COMPETITION_CONSTRAINTS = [
-    "Support custom header payload content through a parameter.",
-    "The custom header payload content length is variable and must be parsed correctly.",
-    "Unpack must still work correctly after customization.",
-    "The project build entrypoint must remain unchanged.",
-    "The original packaging tool invocation must still work with its original arguments.",
-    "Backward compatibility with existing callers must be preserved.",
-    "A callable skill for the packaging tool must be delivered.",
-    "The skill must support THX-related handling and header inspection.",
-    "Reasonable tests must be designed from the codebase structure to validate the change.",
-]
-DEFAULT_ACCEPTANCE_INVARIANTS = [
-    "variable_length_header_payload",
-    "successful_unpack_after_customization",
-    "unchanged_build_entrypoint",
-    "original_cli_compatibility",
-    "skill_delivery_required",
-    "validation_tests_required",
-]
-DEFAULT_TOOLING_INTEGRATION_CONSTRAINTS = {
-    "formatter_tool_available": False,
-    "formatter_invocation_hint": None,
-    "formatter_expected_evidence": None,
-    "optional_tooling": [
-        "future internal formatter/checker may arrive via MCP",
-        "future internal formatter/checker may arrive via Skill",
-        "future internal formatter/checker may arrive via IDEA plugin integration",
-    ],
-}
+DEFAULT_COMPETITION_GOAL = COMPETITION_PROFILE.default_objective
+DEFAULT_COMPETITION_CONSTRAINTS = list(COMPETITION_PROFILE.constraints)
+DEFAULT_ACCEPTANCE_INVARIANTS = list(COMPETITION_PROFILE.acceptance_invariants)
+DEFAULT_TOOLING_INTEGRATION_CONSTRAINTS = dict(COMPETITION_PROFILE.tooling_integration_constraints)
 COMPETITION_REQUIREMENT_THEMES = {
-    "custom_header_payload": [
-        "custom header",
-        "header payload",
-        "variable-length header",
-        "variable length header",
-        "variable_length_header_payload",
-        "custom_header_payload",
-    ],
-    "unpack_correctness": [
-        "unpack",
-        "successful_unpack_after_customization",
-        "unpack_correctness",
-    ],
-    "compatibility": [
-        "compatibility",
-        "backward compatibility",
-        "backward-compatible",
-        "source-compatible",
-        "existing callers",
-        "legacy cli",
-        "original cli",
-        "build entrypoint",
-        "original_cli_compatibility",
-        "unchanged_build_entrypoint",
-    ],
-    "skill_delivery": [
-        "skill",
-        "header inspection",
-        "thx",
-        "skill_delivery_required",
-        "validation_tests_required",
-    ],
+    theme: list(markers) for theme, markers in COMPETITION_PROFILE.requirement_themes.items()
 }
 STAGES = [
     "brainstorm",
@@ -258,6 +210,19 @@ def project_root(value: str | None) -> Path:
 
 def sdd_dir(root: Path) -> Path:
     return root / ".sdd"
+
+
+def runtime_objective_path(root: Path) -> Path:
+    return sdd_dir(root) / "runtime" / "scenario-objective.json"
+
+
+def legacy_runtime_objective_path(root: Path) -> Path:
+    return sdd_dir(root) / "runtime" / "competition-objective.json"
+
+
+def write_runtime_objective_bundle(root: Path, bundle: dict[str, Any]) -> None:
+    atomic_json(runtime_objective_path(root), bundle)
+    atomic_json(legacy_runtime_objective_path(root), bundle)
 
 
 def state_path(root: Path) -> Path:
@@ -618,6 +583,15 @@ def init_project(args: argparse.Namespace) -> None:
     source = Path(__file__).resolve().parent.parent / "assets" / "project-skeleton"
     if (root / ".sdd").exists() and not args.force:
         raise SddError(f"{root} is already initialized; use --force only before a competition run")
+    for legacy_relative in (
+        ".opencode/skills/autonomous-sdd",
+        ".sdd/skills/cpp-unitool-header",
+    ):
+        legacy_path = (root / legacy_relative).resolve()
+        if root not in legacy_path.parents:
+            raise SddError(f"Refusing to remove legacy asset outside project: {legacy_path}")
+        if legacy_path.exists():
+            shutil.rmtree(legacy_path)
     preserve = {"AGENTS.md", "opencode.json", "openspec/config.yaml", ".gitignore"}
     for source_path in source.rglob("*"):
         relative = source_path.relative_to(source)
@@ -629,10 +603,25 @@ def init_project(args: argparse.Namespace) -> None:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_path, target)
+    # A source checkout may retain empty legacy directories after their files are removed.
+    for legacy_relative in (
+        ".opencode/skills/autonomous-sdd",
+        ".sdd/skills/cpp-unitool-header",
+    ):
+        legacy_path = root / legacy_relative
+        if legacy_path.exists():
+            shutil.rmtree(legacy_path)
     ensure_runtime_ignores(root)
     target_runner = root / ".sdd" / "bin" / "sdd.py"
     target_runner.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(Path(__file__).resolve(), target_runner)
+    runtime_package = Path(__file__).resolve().parent.parent / "autonomous_sdd"
+    shutil.copytree(
+        runtime_package,
+        target_runner.parent / "autonomous_sdd",
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
     (root / "sdd.cmd").write_text('@echo off\r\npython "%~dp0.sdd\\bin\\sdd.py" --project "%~dp0." %*\r\n', encoding="utf-8")
     (root / "sdd").write_text(
         '#!/usr/bin/env sh\nexec python3 "$(dirname "$0")/.sdd/bin/sdd.py" --project "$(dirname "$0")" "$@"\n',
@@ -641,7 +630,7 @@ def init_project(args: argparse.Namespace) -> None:
     if not (root / ".git").exists():
         git(root, "init")
     print(f"Initialized Autonomous SDD {VERSION} in {root}")
-    print("Run `sdd compete --task <file-or-text>` for one-command delivery.")
+    print("Select the `autonomous-sdd` OpenCode agent and describe the requested change.")
 
 
 def ensure_runtime_ignores(root: Path) -> None:
@@ -659,7 +648,10 @@ def ensure_runtime_ignores(root: Path) -> None:
 
 def compete(args: argparse.Namespace) -> None:
     source_root = project_root(args.project)
-    objective_bundle = resolve_competition_objective(getattr(args, "task", None), source_root)
+    scenario_profile = getattr(args, "scenario_profile", None) or COMPETITION_PROFILE.name
+    objective_bundle = resolve_scenario_objective(
+        getattr(args, "task", None), source_root, scenario_profile
+    )
     objective = objective_bundle["effective_objective"]
     if not (source_root / ".sdd").exists():
         init_project(argparse.Namespace(project=str(source_root), force=False))
@@ -670,6 +662,7 @@ def compete(args: argparse.Namespace) -> None:
             objective=objective,
             change_id=args.change_id,
             executor=args.executor,
+            scenario_profile=scenario_profile,
         )
         try:
             run_loop(argparse.Namespace(project=str(active_root), max_steps=args.max_steps))
@@ -799,12 +792,18 @@ def assert_compete_request_matches_active_run(
     objective: str,
     change_id: str | None,
     executor: str,
+    scenario_profile: str,
 ) -> dict[str, Any]:
     state = load_state(root)
     if change_id and state.get("change_id") != change_id:
         raise SddError(f"Active run change_id mismatch: requested {change_id}, active {state.get('change_id')}")
     if state.get("objective") != objective:
-        raise SddError("Active run objective does not match the requested competition task")
+        raise SddError("Active run objective does not match the requested scenario task")
+    if state.get("scenario_profile", COMPETITION_PROFILE.name) != scenario_profile:
+        raise SddError(
+            "Active run scenario profile mismatch: "
+            f"requested {scenario_profile}, active {state.get('scenario_profile')}"
+        )
     active_executor = state.get("executor", load_config(root).get("executor", "opencode"))
     if active_executor != executor:
         raise SddError(f"Active run executor mismatch: requested {executor}, active {active_executor}")
@@ -885,7 +884,8 @@ def compete_result_payload(root: Path, state: dict[str, Any]) -> dict[str, Any]:
         report_root = root
     report_path = sdd_dir(report_root) / "delivery-report.md"
     return {
-        "kind": "competition_result",
+        "kind": "hosted_sdd_result",
+        "legacy_kind": "competition_result",
         "status": state["status"],
         "outcome": terminal_outcome(state),
         "run_id": state["run_id"],
@@ -1170,6 +1170,19 @@ def validate_residual_risks(value: Any) -> list[str]:
     return []
 
 
+def validate_skills_used(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return ["Agent result skills_used must be an array"]
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"capability", "name", "source"}:
+            return ["Agent result skills_used entries must contain capability, name, and source"]
+        if not all(isinstance(item[field], str) and item[field].strip() for field in ("capability", "name")):
+            return ["Agent result skills_used capability and name must be non-empty strings"]
+        if item["source"] not in {"project", "host", "profile"}:
+            return ["Agent result skills_used source must be project, host, or profile"]
+    return []
+
+
 def allowed_requirement_statuses_for_stage(stage: str) -> set[str]:
     base = {"satisfied", "partial", "partially_satisfied", "not_satisfied"}
     if stage in {"brainstorm", "proposal", "specs", "design", "tasks", "plan", "review"}:
@@ -1284,6 +1297,7 @@ def validate_agent_result(root: Path, state: dict[str, Any], result: dict[str, A
         "role",
         "created_at",
         "updated_at",
+        "skills_used",
     }
     extra = sorted(set(result) - required - tolerated_metadata)
     missing = sorted(required - set(result))
@@ -1298,6 +1312,8 @@ def validate_agent_result(root: Path, state: dict[str, Any], result: dict[str, A
     for field in ["files_read", "files_changed", "deviations"]:
         errors.extend(validate_string_list(result.get(field), field))
     errors.extend(validate_residual_risks(result.get("residual_risks")))
+    if "skills_used" in result:
+        errors.extend(validate_skills_used(result["skills_used"]))
     commands = result.get("commands_run")
     if not isinstance(commands, list) or not all(
         isinstance(command, list) and command and all(isinstance(part, str) for part in command)
@@ -1334,7 +1350,7 @@ def validate_agent_result(root: Path, state: dict[str, Any], result: dict[str, A
 
 
 def normalize_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value.strip().lower())
+    return normalize_profile_text(value)
 
 
 def evidence_matches_theme(requirement: str, markers: list[str]) -> bool:
@@ -1364,23 +1380,7 @@ def realized_files_match_theme(root: Path, paths: list[str], markers: list[str])
 
 
 def task_expected_themes(task: dict[str, Any] | None) -> list[str]:
-    if not task:
-        return []
-    title = normalize_text(str(task.get("title", "")))
-    details = normalize_text(str(task.get("details", "")))
-    text = f"{title} {details}".strip()
-    expected: list[str] = []
-    if any(marker in text for marker in ["custom header", "header payload", "variable-length", "variable length"]):
-        expected.append("custom_header_payload")
-    if "unpack" in text:
-        expected.append("unpack_correctness")
-    if any(
-        marker in text for marker in ["compatibility", "legacy cli", "original cli", "build entrypoint"]
-    ):
-        expected.append("compatibility")
-    if any(marker in text for marker in ["skill", "header inspection", "thx", "info --json", "info json"]):
-        expected.append("skill_delivery")
-    return list(dict.fromkeys(expected))
+    return profile_task_expected_themes(task, COMPETITION_PROFILE)
 
 
 def parse_plan_task_contracts(root: Path, state: dict[str, Any]) -> dict[str, dict[str, str]]:
@@ -1519,12 +1519,7 @@ def evidence_line_is_specific(value: str) -> bool:
 
 
 def themes_from_text(value: str) -> list[str]:
-    text = normalize_text(value)
-    themes: list[str] = []
-    for theme, markers in COMPETITION_REQUIREMENT_THEMES.items():
-        if any(marker in text for marker in markers):
-            themes.append(theme)
-    return themes
+    return profile_themes_from_text(value, COMPETITION_PROFILE)
 
 
 def contains_word_marker(text: str, marker: str) -> bool:
@@ -1589,7 +1584,7 @@ def validate_plan_contracts(root: Path, state: dict[str, Any]) -> list[str]:
         theme_text = normalize_text(contract.get("theme", ""))
         matched_by_targets = contract_matches_task_targets(task, contract)
         for theme in expected:
-            markers = COMPETITION_REQUIREMENT_THEMES[theme]
+            markers = theme_markers(COMPETITION_PROFILE, theme)
             if not any(marker in theme_text for marker in markers) and not matched_by_targets:
                 errors.append(f"plan.md task {task['id']} theme does not cover expected topic: {theme}")
     extra = sorted(set(contracts) - task_ids)
@@ -1723,7 +1718,7 @@ def resolve_plan_contract_for_task(task: dict[str, Any], contracts: dict[str, di
             return candidate
         theme_text = normalize_text(candidate.get("theme", ""))
         if expected and all(
-            any(marker in theme_text for marker in COMPETITION_REQUIREMENT_THEMES[theme])
+            any(marker in theme_text for marker in theme_markers(COMPETITION_PROFILE, theme))
             for theme in expected
         ):
             return candidate
@@ -1788,7 +1783,7 @@ def validate_plan_commitment_coverage(root: Path, state: dict[str, Any], current
                 errors.append(f"plan.md task {task_id} {field} is not mappable to a competition theme")
                 continue
             for theme in themes:
-                markers = COMPETITION_REQUIREMENT_THEMES[theme]
+                markers = theme_markers(COMPETITION_PROFILE, theme)
                 if not any(evidence_matches_theme(str(item.get("requirement", "")), markers) for item in satisfied):
                     errors.append(f"plan.md task {task_id} {field} has no realized evidence for theme: {theme}")
         implementation_targets = contract.get("implementation_targets", "")
@@ -1797,7 +1792,7 @@ def validate_plan_commitment_coverage(root: Path, state: dict[str, Any], current
         for item in satisfied:
             requirement = str(item.get("requirement", ""))
             if any(
-                evidence_matches_theme(requirement, COMPETITION_REQUIREMENT_THEMES[theme])
+                evidence_matches_theme(requirement, theme_markers(COMPETITION_PROFILE, theme))
                 for theme in fallback_themes
             ):
                 task_evidence.append(item)
@@ -1839,7 +1834,7 @@ def validate_apply_task_requirement_alignment(
     satisfied = [item for item in evidence if isinstance(item, dict) and item.get("status") == "satisfied"]
     errors: list[str] = []
     for theme in expected:
-        markers = COMPETITION_REQUIREMENT_THEMES[theme]
+        markers = theme_markers(COMPETITION_PROFILE, theme)
         if any(evidence_matches_theme(str(item.get("requirement", "")), markers) for item in satisfied):
             continue
         realized_paths = [
@@ -1877,19 +1872,9 @@ def collect_requirement_evidence(root: Path, state: dict[str, Any], current: dic
 
 
 def validate_competition_requirement_coverage(root: Path, state: dict[str, Any], current: dict[str, Any]) -> list[str]:
-    if state["stage"] not in {"verify", "finalize", "archive", "retrospective", "closed"}:
-        return []
     evidence = collect_requirement_evidence(root, state, current)
-    if not evidence:
-        return ["No accumulated requirement evidence found for competition acceptance coverage"]
-    satisfied = [
-        item for item in evidence if isinstance(item, dict) and item.get("status") == "satisfied"
-    ]
-    errors: list[str] = []
-    for theme, markers in COMPETITION_REQUIREMENT_THEMES.items():
-        if not any(evidence_matches_theme(str(item.get("requirement", "")), markers) for item in satisfied):
-            errors.append(f"Competition requirement coverage missing theme: {theme}")
-    return errors
+    profile = get_profile(str(state.get("scenario_profile") or COMPETITION_PROFILE.name))
+    return validate_requirement_coverage(state["stage"], evidence, profile)
 
 
 def focused_test_commands(root: Path, changed: list[str]) -> tuple[list[list[str]], list[str]]:
@@ -1976,38 +1961,14 @@ def read_task(value: str | None, root: Path) -> str:
 
 
 def resolve_competition_objective(value: str | None, root: Path) -> dict[str, Any]:
-    if value:
-        candidate = Path(value)
-        if not candidate.is_absolute():
-            candidate = root / candidate
-        if candidate.is_file():
-            text = candidate.read_text(encoding="utf-8").strip()
-            source = "file"
-            input_path: str | None = str(candidate.resolve())
-        else:
-            text = value.strip()
-            source = "inline"
-            input_path = None
-        if len(text) < 10:
-            raise SddError("Competition task must contain at least 10 characters")
-        branch_default_used = False
-    else:
-        text = DEFAULT_COMPETITION_GOAL
-        source = "default"
-        input_path = None
-        branch_default_used = True
-    return {
-        "source": source,
-        "input_path": input_path,
-        "raw_text": text,
-        "effective_objective": text,
-        "frozen_goal": DEFAULT_COMPETITION_GOAL,
-        "competition_constraints": list(DEFAULT_COMPETITION_CONSTRAINTS),
-        "required_acceptance_invariants": list(DEFAULT_ACCEPTANCE_INVARIANTS),
-        "tooling_integration_constraints": dict(DEFAULT_TOOLING_INTEGRATION_CONSTRAINTS),
-        "branch_default_used": branch_default_used,
-        "frozen_at": now(),
-    }
+    return resolve_scenario_objective(value, root, COMPETITION_PROFILE.name)
+
+
+def resolve_scenario_objective(value: str | None, root: Path, profile_name: str | None) -> dict[str, Any]:
+    try:
+        return resolve_profile_objective(value, root, get_profile(profile_name), frozen_at=now())
+    except ValueError as exc:
+        raise SddError(str(exc)) from exc
 
 
 def slugify(value: str) -> str:
@@ -2077,10 +2038,10 @@ def start(args: argparse.Namespace) -> None:
     root = project_root(args.project)
     baseline_file = sdd_dir(root) / "baseline" / "manifest.json"
     if not baseline_file.exists():
-        raise SddError("Capture the competition baseline before starting")
+        raise SddError("Capture the scenario baseline before starting")
     dirty = git_changed(root)
     if dirty:
-        raise SddError("Start requires a clean competition workspace:\n- " + "\n- ".join(dirty))
+        raise SddError("Start requires a clean scenario workspace:\n- " + "\n- ".join(dirty))
     if state_path(root).exists():
         existing = load_state(root)
         if existing.get("status") not in {"closed", "blocked"}:
@@ -2091,19 +2052,33 @@ def start(args: argparse.Namespace) -> None:
     directory = root / "openspec" / "changes" / change
     directory.mkdir(parents=True, exist_ok=False)
     (directory / ".openspec.yaml").write_text("schema: autonomous-superspec\n", encoding="utf-8")
-    objective_bundle = getattr(args, "objective_bundle", None) or resolve_competition_objective(args.objective, root)
-    atomic_json(sdd_dir(root) / "runtime" / "competition-objective.json", objective_bundle)
+    objective_bundle = getattr(args, "objective_bundle", None) or resolve_scenario_objective(
+        args.objective,
+        root,
+        getattr(args, "scenario_profile", None),
+    )
+    write_runtime_objective_bundle(root, objective_bundle)
+    scenario_profile = str(objective_bundle.get("profile") or COMPETITION_PROFILE.name)
+    selected_profile = get_profile(scenario_profile)
+    scenario_constraints = list(objective_bundle["scenario_constraints"])
+    required_outcomes = list(objective_bundle["required_outcomes"])
+    scenario_tooling = dict(objective_bundle["scenario_tooling_constraints"])
     state = {
         "schema_version": 1,
         "run_id": f"{dt.datetime.now():%Y%m%d%H%M%S}-{uuid.uuid4().hex[:8]}",
         "change_id": change,
         "objective": objective_bundle["effective_objective"],
         "objective_source": objective_bundle["source"],
+        "scenario_objective_source": objective_bundle["source"],
         "objective_input_path": objective_bundle["input_path"],
+        "scenario_profile": selected_profile.name,
+        "scenario_constraints": scenario_constraints,
+        "required_outcomes": required_outcomes,
+        "scenario_tooling_constraints": scenario_tooling,
         "frozen_goal": objective_bundle["frozen_goal"],
-        "competition_constraints": objective_bundle["competition_constraints"],
-        "required_acceptance_invariants": objective_bundle["required_acceptance_invariants"],
-        "tooling_integration_constraints": objective_bundle["tooling_integration_constraints"],
+        "competition_constraints": scenario_constraints,
+        "required_acceptance_invariants": required_outcomes,
+        "tooling_integration_constraints": scenario_tooling,
         "executor": getattr(args, "executor", load_config(root).get("executor", "opencode")),
         "source_root": getattr(args, "source_root", str(root)),
         "work_root": getattr(args, "work_root", str(root)),
@@ -2267,6 +2242,7 @@ def stage_required_reads(root: Path, state: dict[str, Any]) -> list[str]:
     current_contract = current_task_contract(root, state) if stage == "apply" else None
     reads = [
         ".sdd/AGENT-INSTRUCTIONS.md",
+        ".sdd/runtime/scenario-objective.json",
         ".sdd/runtime/competition-objective.json",
         ".sdd/runtime/state.json",
         ".sdd/runtime/current-handoff.json",
@@ -2316,6 +2292,15 @@ def stage_required_reads(root: Path, state: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(reads))
 
 
+def stage_packet_context_summary(state: dict[str, Any]) -> str:
+    stage = str(state.get("stage", ""))
+    if stage == "apply":
+        return "Execute only the current apply task contract and return structured evidence."
+    if stage in {"review", "verify"}:
+        return "Review or verify prior work using only persisted artifacts and deterministic checks."
+    return "Produce only the current stage artifact and structured result without advancing lifecycle state."
+
+
 def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
     competition = load_json(sdd_dir(root) / "policy" / "competition.yaml")
     project_policy = load_json(sdd_dir(root) / "policy" / "project.yaml")
@@ -2340,28 +2325,72 @@ def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
             ]
         )
         allowed = list(dict.fromkeys(allowed))
+    selected_profile = get_profile(str(state.get("scenario_profile", COMPETITION_PROFILE.name)))
+    scenario_profile = selected_profile.name
+    scenario_constraints = list(state.get("scenario_constraints", state.get("competition_constraints", list(DEFAULT_COMPETITION_CONSTRAINTS))))
+    required_outcomes = list(
+        state.get("required_outcomes", state.get("required_acceptance_invariants", list(DEFAULT_ACCEPTANCE_INVARIANTS)))
+    )
+    scenario_tooling_constraints = dict(
+        state.get(
+            "scenario_tooling_constraints",
+            state.get("tooling_integration_constraints", dict(DEFAULT_TOOLING_INTEGRATION_CONSTRAINTS)),
+        )
+    )
+    task = current_task(root, state) if stage == "apply" else None
+    reads = stage_required_reads(root, state)
+    agent_packet = StageAgentPacket(
+        stage=stage,
+        objective=state["objective"],
+        change_id=state["change_id"],
+        task_id=task["id"] if task else None,
+        allowed_paths=tuple(allowed),
+        required_artifacts=tuple(reads),
+        context_summary=stage_packet_context_summary(state),
+        metadata={
+            "packet_contract_version": 2,
+            "run_id": state["run_id"],
+            "role": "implementation" if stage == "apply" else stage,
+            "scenario_profile": scenario_profile,
+            "scenario_constraints": list(scenario_constraints),
+            "required_outcomes": list(required_outcomes),
+            "scenario_tooling_constraints": dict(scenario_tooling_constraints),
+        },
+    ).to_dict()
+    skill_routing = load_config(root).get("skill_routing", {})
+    try:
+        agent_packet["skill_requirements"] = profile_stage_skill_requirements(
+            stage, selected_profile, skill_routing
+        )
+    except ValueError as exc:
+        raise SddError(str(exc)) from exc
     packet = {
         "schema_version": 1,
+        "packet_contract_version": 2,
         "run_id": state["run_id"],
         "change_id": state["change_id"],
         "stage": stage,
-        "role": "implementation" if stage == "apply" else stage,
+        "role": agent_packet["metadata"]["role"],
         "objective": state["objective"],
+        "context_summary": agent_packet.get("context_summary"),
+        "scenario_profile": scenario_profile,
+        "scenario_constraints": scenario_constraints,
+        "required_outcomes": required_outcomes,
+        "scenario_tooling_constraints": scenario_tooling_constraints,
         "frozen_goal": state.get("frozen_goal", DEFAULT_COMPETITION_GOAL),
-        "competition_constraints": state.get("competition_constraints", list(DEFAULT_COMPETITION_CONSTRAINTS)),
-        "required_acceptance_invariants": state.get(
-            "required_acceptance_invariants", list(DEFAULT_ACCEPTANCE_INVARIANTS)
-        ),
-        "tooling_integration_constraints": state.get(
-            "tooling_integration_constraints", dict(DEFAULT_TOOLING_INTEGRATION_CONSTRAINTS)
-        ),
+        "competition_constraints": scenario_constraints,
+        "required_acceptance_invariants": required_outcomes,
+        "tooling_integration_constraints": scenario_tooling_constraints,
         "required_output": required_output(root, state),
-        "task_id": current_task(root, state)["id"] if stage == "apply" and current_task(root, state) else None,
-        "task_title": current_task(root, state)["title"] if stage == "apply" and current_task(root, state) else None,
-        "task_details": current_task(root, state).get("details", "") if stage == "apply" and current_task(root, state) else "",
+        "task_id": task["id"] if task else None,
+        "task_title": task["title"] if task else None,
+        "task_details": task.get("details", "") if task else "",
         "current_task_contract": current_task_contract(root, state) if stage == "apply" else None,
-        "required_reads": stage_required_reads(root, state),
+        "required_reads": reads,
+        "required_artifacts": list(agent_packet["required_artifacts"]),
         "allowed_paths": allowed,
+        "skill_requirements": list(agent_packet["skill_requirements"]),
+        "metadata": dict(agent_packet["metadata"]),
         "forbidden_paths": sorted(
             set(competition["modification"]["forbidden"] + api_policy["public_api"]["protected_paths"])
         ),
@@ -2386,6 +2415,7 @@ def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
                     "status must be satisfied for completion"
                 ),
                 "residual_risks": "array of concrete unverified or deferred risks",
+                "skills_used": "array of {capability, name, source}; source is project, host, or profile",
             },
         },
     }
@@ -2443,7 +2473,7 @@ def prompt_for(packet: dict[str, Any]) -> str:
         else ""
     )
     plan_clause = (
-        "For plan, every task contract must be concrete: Theme must name every competition topic implied by the task title and details, not just the primary headline; "
+        "For plan, every task contract must be concrete: Theme must name every scenario topic implied by the task title and details, not just the primary headline; "
         "if a task mentions custom headers, unpack behavior, CLI compatibility, build entry stability, skill delivery, THX handling, or header inspection anywhere in the task body, repeat those topics explicitly in Theme; "
         "Verification must name the exact behavior or target to check; "
         "Evidence must name the exact files, logs, or outputs to inspect; Implementation Targets and Test Targets must be specific file paths or narrow path groups; "
@@ -2453,10 +2483,11 @@ def prompt_for(packet: dict[str, Any]) -> str:
     )
     return "".join(
         [
-            "You are a bounded executor in an unattended competition workflow. ",
-            "Read .sdd/runtime/task-packet.json and every required file. ",
+            "You are a bounded executor in an unattended hosted SDD workflow. ",
+            "Read .sdd/runtime/task-packet.json and every required file. Prefer scenario-objective.json over legacy competition-objective.json when both are present. ",
             "Use the listed stage template exactly and preserve every required section. ",
-            "Treat frozen_goal, competition_constraints, and required_acceptance_invariants as mandatory. ",
+            "Treat frozen_goal, scenario_constraints, and required_outcomes as mandatory. ",
+            "Legacy packet aliases competition_constraints and required_acceptance_invariants may also be present; they refer to the same requirements. ",
             "Perform exactly the declared stage or one apply task. ",
             stage_execution_clause,
             verify_clause,
@@ -2468,7 +2499,7 @@ def prompt_for(packet: dict[str, Any]) -> str:
             "Do not commit or change lifecycle state. Do not modify policy, baseline, runner, schema, ",
             "dependency manifests, protected API, or forbidden paths. ",
             "Write .sdd/runtime/agent-result.json using status, summary, files_read, files_changed, ",
-            "commands_run, tests, deviations, blocking_reason, task_id, requirement_evidence, and residual_risks. ",
+            "commands_run, tests, deviations, blocking_reason, task_id, requirement_evidence, residual_risks, and skills_used. ",
             "Follow acceptance.result_contract exactly; commands must be argv arrays, not shell strings. ",
             "Optional formatter or checker tooling is supporting evidence only and must not replace core verification. ",
             "For apply, task_id must exactly match the packet and you must not edit task checkboxes; ",
@@ -2511,6 +2542,7 @@ def write_agent_result(
             if task_id
             else [],
             "residual_risks": [],
+            "skills_used": [],
         },
     )
 
@@ -2529,7 +2561,10 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
     requirement_evidence: list[dict[str, Any]] | None = None
     if stage == "brainstorm":
         path = directory / "brainstorm.md"
-        constraints = "\n".join(f"- {item}" for item in state.get("competition_constraints", []))
+        constraints = "\n".join(
+            f"- {item}"
+            for item in state.get("scenario_constraints", state.get("competition_constraints", []))
+        )
         path.write_text(
             "# Brainstorm\n\n## Objective\n\n"
             + state["objective"]
@@ -2579,7 +2614,7 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
     elif stage == "design":
         path = directory / "design.md"
         path.write_text(
-            "# Technical Design\n\n## Context\n\nThe target C++ packaging project must support custom header payload customization under competition constraints."
+            "# Technical Design\n\n## Context\n\nThe target C++ packaging project must support custom header payload customization under the active scenario constraints."
             "\n\n## Goals\n\nImplement parameter-driven variable-length header payload support, preserve unpack correctness, preserve legacy entrypoints, and deliver the tool skill."
             "\n\n## Non-Goals\n\nNo build entrypoint change, no dependency expansion, no broad format redesign."
             "\n\n## Existing API Verification\n\n| API | Source | Result |\n|---|---|---|\n| protected surface | baseline | unchanged |"
@@ -2640,8 +2675,8 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
             test = root / "tests" / "skill" / "fixture_skill_test.txt"
         impl.parent.mkdir(parents=True, exist_ok=True)
         test.parent.mkdir(parents=True, exist_ok=True)
-        impl.write_text(f"deterministic competition rehearsal implementation task {task['id']} completed\n", encoding="utf-8")
-        test.write_text(f"deterministic competition rehearsal test task {task['id']} completed\n", encoding="utf-8")
+        impl.write_text(f"deterministic scenario rehearsal implementation task {task['id']} completed\n", encoding="utf-8")
+        test.write_text(f"deterministic scenario rehearsal test task {task['id']} completed\n", encoding="utf-8")
         changed.extend([rel(root, impl), rel(root, test)])
         if task["id"] == "1.1":
             requirement_evidence = [
@@ -2798,6 +2833,8 @@ def invoke_agent(root: Path, state: dict[str, Any], dry_run: bool) -> None:
     command = [
         "opencode",
         "run",
+        "--agent",
+        STAGE_AGENT_NAME,
         "--format",
         "json",
         "--dir",
@@ -3069,6 +3106,7 @@ def write_handoff(
         "open_findings": list(state.get("open_findings", [])),
         "residual_risks": list(agent_result.get("residual_risks", []))
         + ([] if completed_stage == "verify" else ["Full project verification has not run yet"]),
+        "skills_used": list(agent_result.get("skills_used", [])),
         "next_action": "execute_stage" if next_stage != "closed" else "emit_final_report",
         "created_at": now(),
     }
@@ -3475,7 +3513,10 @@ def rehearse_recovery(args: argparse.Namespace) -> None:
     with services.locks():
         snapshot = services.workspace.initialize(VERSION)
     root = services.workspace.work_project_root
-    objective_bundle = resolve_competition_objective(getattr(args, "task", None), source_root)
+    scenario_profile = getattr(args, "scenario_profile", None) or COMPETITION_PROFILE.name
+    objective_bundle = resolve_scenario_objective(
+        getattr(args, "task", None), source_root, scenario_profile
+    )
     objective = objective_bundle["effective_objective"]
     change_id = unique_change_id(root, args.change_id or slugify(objective))
     start(
@@ -3485,6 +3526,7 @@ def rehearse_recovery(args: argparse.Namespace) -> None:
             objective=objective,
             objective_bundle=objective_bundle,
             executor="fixture",
+            scenario_profile=scenario_profile,
             source_root=str(source_root),
             work_root=str(snapshot.work_root),
             source_head=snapshot.source_head,
@@ -3519,6 +3561,7 @@ def rehearse_recovery(args: argparse.Namespace) -> None:
             change_id=change_id,
             executor="fixture",
             max_steps=args.max_steps,
+            scenario_profile=scenario_profile,
         )
     )
     final_state = load_state(source_root)
@@ -3721,7 +3764,7 @@ def resolve_runtime_root(project: Path) -> Path:
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(prog="sdd", description="Autonomous competition SDD runner")
+    result = argparse.ArgumentParser(prog="sdd", description="Autonomous hosted SDD runner")
     result.add_argument("--project", help="Target project directory")
     result.add_argument("--version", action="version", version=VERSION)
     sub = result.add_subparsers(dest="command", required=True)
@@ -3731,10 +3774,17 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("--force", action="store_true")
     init.set_defaults(func=init_project)
 
-    competition = sub.add_parser("compete", help="Run the entire competition workflow with one command")
+    competition = sub.add_parser("compete", help="Run the entire hosted SDD workflow with one command")
     competition.add_argument(
         "--task",
-        help="Optional task file path or inline task text; default is the built-in C++ competition objective",
+        help="Optional task file path or inline task text; default comes from the selected scenario profile",
+    )
+    competition.add_argument(
+        "--profile",
+        dest="scenario_profile",
+        choices=registered_profiles(),
+        default=COMPETITION_PROFILE.name,
+        help="Scenario profile controlling defaults, acceptance themes, and skill routing",
     )
     competition.add_argument("--change-id", help="Optional kebab-case change identifier")
     competition.add_argument("--executor", choices=["opencode", "fixture"], default="opencode")
@@ -3747,6 +3797,12 @@ def parser() -> argparse.ArgumentParser:
     start_cmd = sub.add_parser("start", help="Start a bounded change")
     start_cmd.add_argument("change_id")
     start_cmd.add_argument("objective")
+    start_cmd.add_argument(
+        "--profile",
+        dest="scenario_profile",
+        choices=registered_profiles(),
+        default=COMPETITION_PROFILE.name,
+    )
     start_cmd.set_defaults(func=start)
 
     once = sub.add_parser("run-once", help="Execute one stage or apply task")
@@ -3774,7 +3830,13 @@ def parser() -> argparse.ArgumentParser:
     )
     rehearse_recovery_cmd.add_argument(
         "--task",
-        help="Optional task file path or inline task text; default is the built-in C++ competition objective",
+        help="Optional task file path or inline task text; default comes from the selected scenario profile",
+    )
+    rehearse_recovery_cmd.add_argument(
+        "--profile",
+        dest="scenario_profile",
+        choices=registered_profiles(),
+        default=COMPETITION_PROFILE.name,
     )
     rehearse_recovery_cmd.add_argument("--change-id", help="Optional kebab-case change identifier")
     rehearse_recovery_cmd.add_argument("--max-steps", type=int, default=50)

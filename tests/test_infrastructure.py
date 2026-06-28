@@ -13,9 +13,19 @@ from autonomous_sdd.config import (
     freeze_effective_runtime,
     verify_frozen_runtime,
 )
+from autonomous_sdd.agent_protocol import SkillRequirement, StageAgentPacket, StageAgentResult
 from autonomous_sdd.errors import ConfigurationError, PathSafetyError, WorkspaceError
 from autonomous_sdd.locking import FileLock, repository_lock_key
 from autonomous_sdd.paths import resolve_beneath
+from autonomous_sdd.profiles import (
+    COMPETITION_PROFILE,
+    GENERIC_HOSTED_PROFILE,
+    get_profile,
+    registered_profiles,
+    resolve_profile_objective,
+    stage_skill_requirements,
+    task_expected_themes,
+)
 from autonomous_sdd.repository import Repository
 from autonomous_sdd.services import create_runtime_services
 from autonomous_sdd.workspace import RunWorkspace, create_run_context
@@ -292,6 +302,21 @@ class InfrastructureTest(unittest.TestCase):
         self.assertEqual(1, config["budget"]["maximum_stage_retries"])
         self.assertEqual(4, config["budget"]["maximum_repeated_failure_signatures"])
 
+    def test_project_skeleton_defines_bounded_stage_agent(self) -> None:
+        agent = ROOT / "assets" / "project-skeleton" / ".opencode" / "agents" / "sdd-stage.md"
+        content = agent.read_text(encoding="utf-8")
+        self.assertIn("mode: primary", content)
+        self.assertIn("task: deny", content)
+        self.assertIn("skill: allow", content)
+        self.assertIn("host-approved skill locations", content)
+        host_agent = ROOT / "assets" / "project-skeleton" / ".opencode" / "agents" / "autonomous-sdd.md"
+        host_content = host_agent.read_text(encoding="utf-8")
+        self.assertIn("mode: primary", host_content)
+        self.assertIn("compete --profile generic-hosted", host_content)
+        self.assertFalse(
+            (ROOT / "assets" / "project-skeleton" / ".opencode" / "skills" / "autonomous-sdd" / "SKILL.md").exists()
+        )
+
     def test_policy_allows_stricter_change_limits(self) -> None:
         runtime = build_effective_runtime(
             config_override={"budget": {"maximum_agent_invocations": 10}},
@@ -337,6 +362,106 @@ class InfrastructureTest(unittest.TestCase):
         services.workspace.initialize("0.4.0-dev")
         hashes = services.freeze_runtime()
         self.assertEqual({"config_sha256", "policy_sha256"}, set(hashes))
+
+    def test_agent_protocol_models_capture_stage_packet_and_result_contracts(self) -> None:
+        packet = StageAgentPacket(
+            stage="apply",
+            objective="Implement a scoped change",
+            change_id="agent-contract",
+            task_id="1.2",
+            allowed_paths=("src/**", "tests/**"),
+            required_artifacts=("openspec/changes/agent-contract/tasks.md",),
+            skill_requirements=(
+                SkillRequirement(
+                    "coding",
+                    "Apply code changes under internal standards",
+                    candidates=("project-coder", "company-coder"),
+                ),
+                SkillRequirement("review", "Run internal review heuristics", required=False),
+            ),
+            context_summary="Only process the current task packet and prior handoff.",
+            metadata={"profile": "internal-managed"},
+        )
+        result = StageAgentResult(
+            status="completed",
+            summary="Task packet executed with focused edits.",
+            files_read=("src/main.py",),
+            files_changed=("src/main.py", "tests/test_main.py"),
+            next_hints=("verify focused tests",),
+        )
+        self.assertEqual("apply", packet.to_dict()["stage"])
+        self.assertEqual("coding", packet.to_dict()["skill_requirements"][0]["capability"])
+        self.assertEqual("project-coder", packet.to_dict()["skill_requirements"][0]["name"])
+        self.assertEqual(
+            ["project-coder", "company-coder"],
+            packet.to_dict()["skill_requirements"][0]["candidates"],
+        )
+        self.assertEqual("internal-managed", packet.to_dict()["metadata"]["profile"])
+        self.assertEqual("completed", result.to_dict()["status"])
+        self.assertEqual(["src/main.py", "tests/test_main.py"], result.to_dict()["files_changed"])
+
+    def test_profile_objective_and_theme_helpers_are_runner_agnostic(self) -> None:
+        bundle = resolve_profile_objective(None, self.project, COMPETITION_PROFILE, frozen_at="2026-06-28T00:00:00+00:00")
+        self.assertEqual("competition-cpp-header-payload", bundle["profile"])
+        self.assertEqual(COMPETITION_PROFILE.default_objective, bundle["effective_objective"])
+        self.assertTrue(bundle["branch_default_used"])
+        self.assertEqual(
+            ["custom_header_payload", "skill_delivery"],
+            task_expected_themes(
+                {
+                    "title": "Deliver the skill with custom header inspection support",
+                    "details": "Support THX header inspection and custom header payload guidance",
+                },
+                COMPETITION_PROFILE,
+            ),
+        )
+        self.assertEqual("coding-skill", stage_skill_requirements("apply", COMPETITION_PROFILE)[0]["name"])
+        self.assertEqual("review-skill", stage_skill_requirements("verify", COMPETITION_PROFILE)[0]["name"])
+        overridden = stage_skill_requirements(
+            "apply",
+            GENERIC_HOSTED_PROFILE,
+            {"capabilities": {"coding": ["project-coder", "company-coder"]}},
+        )[0]
+        self.assertEqual("coding", overridden["capability"])
+        self.assertEqual(["project-coder", "company-coder"], overridden["candidates"])
+        self.assertEqual("project-coder", overridden["name"])
+        with self.assertRaises(ValueError):
+            stage_skill_requirements(
+                "apply",
+                GENERIC_HOSTED_PROFILE,
+                {"capabilities": {"coding": "not-a-list"}},
+            )
+        self.assertEqual([], stage_skill_requirements("brainstorm", COMPETITION_PROFILE))
+        self.assertEqual(COMPETITION_PROFILE, get_profile("competition-cpp-header-payload"))
+        self.assertEqual(GENERIC_HOSTED_PROFILE, get_profile("generic-hosted"))
+        self.assertIn("competition-cpp-header-payload", registered_profiles())
+        self.assertIn("generic-hosted", registered_profiles())
+        generic_bundle = resolve_profile_objective(
+            None,
+            self.project,
+            GENERIC_HOSTED_PROFILE,
+            frozen_at="2026-06-28T00:00:00+00:00",
+        )
+        self.assertEqual("generic-hosted", generic_bundle["profile"])
+        self.assertEqual(generic_bundle["scenario_constraints"], generic_bundle["competition_constraints"])
+        self.assertEqual(generic_bundle["required_outcomes"], generic_bundle["required_acceptance_invariants"])
+        self.assertEqual(
+            generic_bundle["scenario_tooling_constraints"],
+            generic_bundle["tooling_integration_constraints"],
+        )
+        self.assertNotIn(
+            "skill_delivery",
+            task_expected_themes(
+                {"title": "Expose info --json", "details": "Add machine-readable output"},
+                GENERIC_HOSTED_PROFILE,
+            ),
+        )
+        self.assertEqual(
+            "verification-skill",
+            stage_skill_requirements("verify", GENERIC_HOSTED_PROFILE)[0]["name"],
+        )
+        with self.assertRaises(ValueError):
+            get_profile("missing-profile")
 
     @unittest.skipIf(os.name == "nt", "POSIX symlink semantics")
     def test_symlink_escape_is_rejected(self) -> None:
