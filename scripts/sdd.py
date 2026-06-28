@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import uuid
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -54,8 +55,13 @@ from autonomous_sdd.repository import Repository
 
 
 VERSION = "0.3.0"
-STAGE_AGENT_NAME = "sdd-stage"
-MIN_APPLY_TASKS = 3
+DEFAULT_STAGE_EXECUTION_MODE = "subagent"
+STAGE_EXECUTION_AGENT_NAMES = {
+    "subagent": "sdd-subagent",
+    "stage-agent": "sdd-stage",
+}
+AGENT_RESULT_GRACE_SECONDS = 15
+MIN_APPLY_TASKS = 2
 MAX_APPLY_TASKS = 20
 DEFAULT_COMPETITION_GOAL = COMPETITION_PROFILE.default_objective
 DEFAULT_COMPETITION_CONSTRAINTS = list(COMPETITION_PROFILE.constraints)
@@ -109,6 +115,13 @@ REQUIRED_SECTIONS = {
     "verify": ["Structural Validation", "Requirement Traceability", "Quality Gates", "Decision"],
     "finalize": ["Outcome", "Repository State", "Evidence"],
 }
+OPENSPEC_COMMAND_ALIASES = {"openspec", "openspec.cmd"}
+PROJECT_OPENSPEC_RELATIVE_CANDIDATES = (
+    Path(".sdd") / "tools" / "openspec" / "openspec.cmd",
+    Path(".sdd") / "tools" / "openspec" / "openspec",
+    Path(".sdd") / "tools" / "openspec" / "bin" / "openspec.cmd",
+    Path(".sdd") / "tools" / "openspec" / "bin" / "openspec",
+)
 
 
 class SddError(RuntimeError):
@@ -156,6 +169,8 @@ def run_command(
     timeout: int = 600,
     check: bool = False,
     capture: bool = True,
+    result_path: Path | None = None,
+    result_grace_seconds: float = 0,
 ) -> subprocess.CompletedProcess[str]:
     executable = shutil.which(args[0])
     if executable:
@@ -172,12 +187,31 @@ def run_command(
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
         start_new_session=os.name != "nt",
     )
-    try:
-        stdout, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        terminate_process_tree(process)
-        stdout, _ = process.communicate()
-        raise subprocess.TimeoutExpired(args, timeout, output=stdout)
+    stdout = ""
+    deadline = time.monotonic() + timeout
+    result_grace_started: float | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            terminate_process_tree(process)
+            stdout, _ = process.communicate()
+            raise subprocess.TimeoutExpired(args, timeout, output=stdout)
+        try:
+            stdout, _ = process.communicate(timeout=min(1.0, remaining))
+            break
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.output or ""
+            if result_path and result_grace_seconds > 0 and result_path.exists():
+                if result_grace_started is None:
+                    result_grace_started = time.monotonic()
+                elif time.monotonic() - result_grace_started >= result_grace_seconds:
+                    terminate_process_tree(process)
+                    stdout, _ = process.communicate()
+                    stdout = (stdout or "") + (
+                        f"\n[RESULT_FILE_GRACE_EXIT] terminated process after waiting "
+                        f"{result_grace_seconds:g} seconds for exit after {result_path} was written\n"
+                    )
+                    return subprocess.CompletedProcess(args, 0, stdout, None)
     result = subprocess.CompletedProcess(args, process.returncode, stdout, None)
     if check and result.returncode != 0:
         raise SddError(f"Command failed ({result.returncode}): {' '.join(args)}\n{result.stdout or ''}")
@@ -217,6 +251,28 @@ def sdd_dir(root: Path) -> Path:
     return root / ".sdd"
 
 
+def resolve_openspec_executable(root: Path) -> str:
+    for relative in PROJECT_OPENSPEC_RELATIVE_CANDIDATES:
+        candidate = root / relative
+        if candidate.is_file():
+            return str(candidate.resolve())
+    preferred_names = ("openspec.cmd", "openspec") if os.name == "nt" else ("openspec", "openspec.cmd")
+    for name in preferred_names:
+        discovered = shutil.which(name)
+        if discovered:
+            return discovered
+    return "openspec.cmd" if os.name == "nt" else "openspec"
+
+
+def resolve_runtime_command(root: Path, command: list[str]) -> list[str]:
+    if not command:
+        return []
+    head = Path(command[0]).name.lower()
+    if head in OPENSPEC_COMMAND_ALIASES:
+        return [resolve_openspec_executable(root), *command[1:]]
+    return list(command)
+
+
 def runtime_objective_path(root: Path) -> Path:
     return sdd_dir(root) / "runtime" / "scenario-objective.json"
 
@@ -249,6 +305,22 @@ def load_config(root: Path) -> dict[str, Any]:
 
 def save_config(root: Path, config: dict[str, Any]) -> None:
     atomic_json(sdd_dir(root) / "config.yaml", config)
+
+
+def stage_execution_mode(config: dict[str, Any] | None = None) -> str:
+    current = config or {}
+    section = current.get("stage_execution", {})
+    if not isinstance(section, dict):
+        raise SddError("config.stage_execution must be an object")
+    mode = section.get("mode", DEFAULT_STAGE_EXECUTION_MODE)
+    if mode not in STAGE_EXECUTION_AGENT_NAMES:
+        supported = ", ".join(sorted(STAGE_EXECUTION_AGENT_NAMES))
+        raise SddError(f"Unsupported stage_execution.mode: {mode}. Supported: {supported}")
+    return str(mode)
+
+
+def stage_execution_agent_name(config: dict[str, Any] | None = None) -> str:
+    return STAGE_EXECUTION_AGENT_NAMES[stage_execution_mode(config)]
 
 
 def budget_value(root: Path, key: str, default: int) -> int:
@@ -331,6 +403,64 @@ def process_is_alive(pid: int) -> bool:
         return exc.errno != errno.ESRCH
 
 
+def current_process_started_at() -> float | None:
+    if os.name != "nt":
+        return None
+    return windows_process_started_at(os.getpid())
+
+
+def windows_process_started_at(pid: int) -> float | None:
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    error_invalid_parameter = 87
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    open_process.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    get_process_times = kernel32.GetProcessTimes
+    get_process_times.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    )
+    get_process_times.restype = wintypes.BOOL
+
+    handle = open_process(process_query_limited_information, False, pid)
+    if not handle:
+        if ctypes.get_last_error() == error_invalid_parameter:
+            return None
+        return None
+    try:
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel_time = wintypes.FILETIME()
+        user_time = wintypes.FILETIME()
+        if not get_process_times(handle, ctypes.byref(creation), ctypes.byref(exit_time), ctypes.byref(kernel_time), ctypes.byref(user_time)):
+            return None
+        ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+        return ticks / 10_000_000 - 11644473600
+    finally:
+        close_handle(handle)
+
+
+def process_matches_lock_owner(pid: int, started_at: float | None) -> bool:
+    if not process_is_alive(pid):
+        return False
+    if os.name != "nt" or started_at is None:
+        return True
+    observed = windows_process_started_at(pid)
+    if observed is None:
+        return False
+    return abs(observed - started_at) < 2.0
+
+
 def windows_process_is_alive(pid: int) -> bool:
     import ctypes
     from ctypes import wintypes
@@ -394,22 +524,43 @@ def linux_execution_lock(root: Path):
 def pid_file_execution_lock(root: Path):
     path = sdd_dir(root) / "runtime" / "execution.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
-    deadline = time.time() + 5
+    deadline = time.time() + 15
     while True:
         try:
             descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump({"pid": os.getpid(), "created_at": now()}, stream)
+                json.dump(
+                    {
+                        "pid": os.getpid(),
+                        "created_at": now(),
+                        "process_started_at": current_process_started_at(),
+                    },
+                    stream,
+                )
             break
         except FileExistsError:
             try:
                 owner = load_json(path)
                 pid = int(owner.get("pid", -1))
+                started_at = owner.get("process_started_at")
+                started_at = float(started_at) if started_at is not None else None
             except (SddError, TypeError, ValueError):
                 pid = -1
-            if process_is_alive(pid):
+                started_at = None
+            if process_matches_lock_owner(pid, started_at):
                 if time.time() < deadline:
                     time.sleep(0.1)
+                    continue
+                try:
+                    owner = load_json(path)
+                    pid = int(owner.get("pid", -1))
+                    started_at = owner.get("process_started_at")
+                    started_at = float(started_at) if started_at is not None else None
+                except (SddError, TypeError, ValueError):
+                    pid = -1
+                    started_at = None
+                if not process_matches_lock_owner(pid, started_at):
+                    path.unlink(missing_ok=True)
                     continue
                 raise SddError(f"Another Runner owns the workspace lock: pid={pid}")
             path.unlink(missing_ok=True)
@@ -674,10 +825,10 @@ def compete(args: argparse.Namespace) -> None:
         except Exception:
             if load_state(active_root).get("status") in {"closed", "blocked"}:
                 final = finalize_hosted_run(active_root, source_root)
-                raise_compete_result(active_root, final)
+                raise_profile_result(active_root, final)
             raise
         final = finalize_hosted_run(active_root, source_root)
-        raise_compete_result(active_root, final)
+        raise_profile_result(active_root, final)
         return
     ensure_git_identity(source_root)
     detected = detect_project(source_root)
@@ -726,7 +877,7 @@ def compete(args: argparse.Namespace) -> None:
             state = load_state(root)
             if state.get("status") in {"closed", "blocked"}:
                 final = finalize_hosted_run(root, source_root)
-                raise_compete_result(root, final)
+                raise_profile_result(root, final)
         elif services.workspace.run_dir.exists():
             shutil.rmtree(services.workspace.run_dir, ignore_errors=True)
             clear_active_run_locator(source_root)
@@ -734,7 +885,7 @@ def compete(args: argparse.Namespace) -> None:
     else:
         if root is not None and state_path(root).exists():
             final = finalize_hosted_run(root, source_root)
-            raise_compete_result(root, final)
+            raise_profile_result(root, final)
 
 
 def mirror_worktree(source: Path, target: Path) -> None:
@@ -848,8 +999,17 @@ def finalize_hosted_run(root: Path, source_root: Path) -> dict[str, Any]:
     return state
 
 
-def finalize_competition_run(root: Path, source_root: Path) -> dict[str, Any]:
+def finalize_profile_run(root: Path, source_root: Path) -> dict[str, Any]:
     return finalize_hosted_run(root, source_root)
+
+
+def finalize_competition_run(root: Path, source_root: Path) -> dict[str, Any]:
+    warnings.warn(
+        "finalize_competition_run() is deprecated; use finalize_profile_run() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return finalize_profile_run(root, source_root)
 
 
 def source_workspace_drift(root: Path, state: dict[str, Any], source_root: Path) -> list[str]:
@@ -882,12 +1042,12 @@ def normalize_repository_status(value: Any) -> dict[str, list[str]]:
     return normalized
 
 
-def compete_result_payload(root: Path, state: dict[str, Any]) -> dict[str, Any]:
+def profile_result_payload(root: Path, state: dict[str, Any]) -> dict[str, Any]:
     if state_path(root).exists():
         merged_state = load_state(root)
         merged_state.update(state)
         state = merged_state
-    decision = compete_decision(state)
+    decision = profile_decision(state)
     report_root = Path(str(state.get("source_root") or root))
     if not (sdd_dir(report_root) / "delivery-report.md").exists():
         report_root = root
@@ -905,21 +1065,45 @@ def compete_result_payload(root: Path, state: dict[str, Any]) -> dict[str, Any]:
         "decision": decision["decision"],
         "reason": decision["reason"],
         "recommended_action": decision["recommended_action"],
-        "exit_code": compete_exit_code(decision),
+        "exit_code": profile_exit_code(decision),
     }
 
 
-def emit_compete_result(root: Path, state: dict[str, Any]) -> None:
-    payload = compete_result_payload(root, state)
+def compete_result_payload(root: Path, state: dict[str, Any]) -> dict[str, Any]:
+    warnings.warn(
+        "compete_result_payload() is deprecated; use profile_result_payload() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return profile_result_payload(root, state)
+
+
+def emit_profile_result(root: Path, state: dict[str, Any]) -> None:
+    payload = profile_result_payload(root, state)
     print(f"RESULT={payload['status'].upper()}")
     print(f"REPORT={payload['report']}")
     print(json.dumps(payload, ensure_ascii=False))
 
 
-def compete_decision(state: dict[str, Any]) -> dict[str, str]:
+def emit_compete_result(root: Path, state: dict[str, Any]) -> None:
+    warnings.warn(
+        "emit_compete_result() is deprecated; use emit_profile_result() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    emit_profile_result(root, state)
+
+
+def profile_decision(state: dict[str, Any]) -> dict[str, str]:
     status = state["status"]
     if status == "closed":
         outcome = terminal_outcome(state)
+        if outcome == "closed_with_findings":
+            return {
+                "decision": "completed_partial",
+                "reason": "Hosted run completed, but unresolved findings were carried forward in the final delivery report.",
+                "recommended_action": "none",
+            }
         if outcome == "closed_partial":
             return {
                 "decision": "completed_partial",
@@ -956,7 +1140,16 @@ def compete_decision(state: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def compete_exit_code(decision: dict[str, str]) -> int:
+def compete_decision(state: dict[str, Any]) -> dict[str, str]:
+    warnings.warn(
+        "compete_decision() is deprecated; use profile_decision() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return profile_decision(state)
+
+
+def profile_exit_code(decision: dict[str, str]) -> int:
     mapping = {
         "completed": 0,
         "completed_partial": 0,
@@ -967,13 +1160,31 @@ def compete_exit_code(decision: dict[str, str]) -> int:
     return mapping.get(decision["decision"], 2)
 
 
-def raise_compete_result(root: Path, state: dict[str, Any]) -> None:
-    payload = compete_result_payload(root, state)
+def compete_exit_code(decision: dict[str, str]) -> int:
+    warnings.warn(
+        "compete_exit_code() is deprecated; use profile_exit_code() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return profile_exit_code(decision)
+
+
+def raise_profile_result(root: Path, state: dict[str, Any]) -> None:
+    payload = profile_result_payload(root, state)
     print(f"RESULT={payload['status'].upper()}")
     print(f"REPORT={payload['report']}")
     print(json.dumps(payload, ensure_ascii=False))
     if payload["exit_code"] != 0:
         raise SddExit(payload["reason"], payload["exit_code"])
+
+
+def raise_compete_result(root: Path, state: dict[str, Any]) -> None:
+    warnings.warn(
+        "raise_compete_result() is deprecated; use raise_profile_result() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    raise_profile_result(root, state)
 
 
 def resolve_resume_root(project: Path) -> Path:
@@ -1272,12 +1483,16 @@ def normalize_requirement_evidence_for_stage(
 
 def validate_agent_result(root: Path, state: dict[str, Any], result: dict[str, Any]) -> list[str]:
     errors: list[str] = []
+    stage = str(state.get("stage", ""))
     if "deviations" not in result or "blocking_reason" not in result:
         result = dict(result)
         if "deviations" not in result:
             result["deviations"] = []
         if "blocking_reason" not in result:
             result["blocking_reason"] = None
+    if stage != "apply" and "task_id" not in result:
+        result = dict(result)
+        result["task_id"] = None
     if isinstance(result.get("deviations"), str) and result.get("deviations", "").strip():
         result = dict(result)
         result["deviations"] = [result["deviations"].strip()]
@@ -1319,6 +1534,12 @@ def validate_agent_result(root: Path, state: dict[str, Any], result: dict[str, A
         errors.append("Agent result status is invalid")
     if not isinstance(result.get("summary"), str) or not result.get("summary", "").strip():
         errors.append("Agent result summary must be a non-empty string")
+    task_id = result.get("task_id")
+    if stage == "apply":
+        if not isinstance(task_id, str) or not task_id.strip():
+            errors.append("Apply result task_id must be a non-empty string")
+    elif task_id is not None and not isinstance(task_id, str):
+        errors.append("Non-apply result task_id must be null or a string")
     for field in ["files_read", "files_changed", "deviations"]:
         errors.extend(validate_string_list(result.get(field), field))
     errors.extend(validate_residual_risks(result.get("residual_risks")))
@@ -1634,7 +1855,13 @@ def split_gate_findings(stage: str, errors: list[str]) -> tuple[list[str], list[
     return hard, soft
 
 
-def finding_records(stage: str, findings: list[str], *, deferred_to: str | None = None) -> list[dict[str, Any]]:
+def finding_records(
+    stage: str,
+    findings: list[str],
+    *,
+    deferred_to: str | None = None,
+    task_id: str | None = None,
+) -> list[dict[str, Any]]:
     return [
         {
             "stage": stage,
@@ -1642,6 +1869,7 @@ def finding_records(stage: str, findings: list[str], *, deferred_to: str | None 
             "message": finding,
             "status": "open",
             "deferred_to": deferred_to,
+            **({"task_id": task_id} if task_id else {}),
         }
         for finding in findings
     ]
@@ -1654,6 +1882,7 @@ def merge_open_findings(state: dict[str, Any], records: list[dict[str, Any]]) ->
             isinstance(item, dict)
             and item.get("stage") == record.get("stage")
             and item.get("message") == record.get("message")
+            and item.get("task_id") == record.get("task_id")
             and item.get("status") == "open"
             for item in existing
         ):
@@ -1889,10 +2118,19 @@ def collect_requirement_evidence(root: Path, state: dict[str, Any], current: dic
     return collected
 
 
-def validate_competition_requirement_coverage(root: Path, state: dict[str, Any], current: dict[str, Any]) -> list[str]:
+def validate_profile_requirement_coverage(root: Path, state: dict[str, Any], current: dict[str, Any]) -> list[str]:
     evidence = collect_requirement_evidence(root, state, current)
     profile = get_profile(str(state.get("scenario_profile") or DEFAULT_PROFILE.name))
     return validate_requirement_coverage(state["stage"], evidence, profile)
+
+
+def validate_competition_requirement_coverage(root: Path, state: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    warnings.warn(
+        "validate_competition_requirement_coverage() is deprecated; use validate_profile_requirement_coverage() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return validate_profile_requirement_coverage(root, state, current)
 
 
 def focused_test_commands(root: Path, changed: list[str]) -> tuple[list[list[str]], list[str]]:
@@ -2014,7 +2252,7 @@ def doctor(args: argparse.Namespace) -> None:
         "python": [sys.executable, "--version"],
         "git": ["git", "--version"],
         "opencode": ["opencode", "--version"],
-        "openspec": ["openspec.cmd" if os.name == "nt" else "openspec", "--version"],
+        "openspec": resolve_runtime_command(root, ["openspec.cmd" if os.name == "nt" else "openspec", "--version"]),
     }
     failed = False
     for name, command in checks.items():
@@ -2058,6 +2296,7 @@ def baseline(args: argparse.Namespace) -> None:
 
 def start(args: argparse.Namespace) -> None:
     root = project_root(args.project)
+    config = load_config(root)
     baseline_file = sdd_dir(root) / "baseline" / "manifest.json"
     if not baseline_file.exists():
         raise SddError("Capture the scenario baseline before starting")
@@ -2101,7 +2340,8 @@ def start(args: argparse.Namespace) -> None:
         "competition_constraints": scenario_constraints,
         "required_acceptance_invariants": required_outcomes,
         "tooling_integration_constraints": scenario_tooling,
-        "executor": getattr(args, "executor", load_config(root).get("executor", "opencode")),
+        "executor": getattr(args, "executor", config.get("executor", "opencode")),
+        "stage_execution_mode": stage_execution_mode(config),
         "source_root": getattr(args, "source_root", str(root)),
         "work_root": getattr(args, "work_root", str(root)),
         "source_head": getattr(args, "source_head", None),
@@ -2374,6 +2614,7 @@ def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
             "run_id": state["run_id"],
             "role": "implementation" if stage == "apply" else stage,
             "scenario_profile": scenario_profile,
+            "stage_execution_mode": str(state.get("stage_execution_mode") or DEFAULT_STAGE_EXECUTION_MODE),
             "scenario_constraints": list(scenario_constraints),
             "required_outcomes": list(required_outcomes),
             "scenario_tooling_constraints": dict(scenario_tooling_constraints),
@@ -2569,6 +2810,30 @@ def write_agent_result(
     )
 
 
+def _format_fixture_constraints(state: dict[str, Any]) -> str:
+    """Format state constraints as a bulleted list for template substitution."""
+    return "\n".join(
+        f"- {item}"
+        for item in state.get("scenario_constraints", state.get("competition_constraints", []))
+    )
+
+
+def _resolve_fixture_template(state: dict[str, Any], stage: str) -> str | None:
+    """Resolve the fixture template for a stage from the active profile, with fallback."""
+    try:
+        profile = get_profile(str(state.get("scenario_profile") or DEFAULT_PROFILE.name))
+    except (ValueError, KeyError):
+        profile = DEFAULT_PROFILE
+    template = profile.fixture_templates.get(stage)
+    if template is not None:
+        return template
+    return DEFAULT_PROFILE.fixture_templates.get(stage)
+
+
+# Stages handled by code-based logic in fixture_execute rather than profile templates.
+_FIXTURE_CODE_STAGES = {"apply"}
+
+
 def fixture_execute(root: Path, state: dict[str, Any]) -> None:
     """Deterministic lifecycle executor used to validate orchestration itself."""
     stage = state["stage"]
@@ -2581,110 +2846,13 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
     directory = change_dir(root, state)
     changed: list[str] = []
     requirement_evidence: list[dict[str, Any]] | None = None
-    if stage == "brainstorm":
-        path = directory / "brainstorm.md"
-        constraints = "\n".join(
-            f"- {item}"
-            for item in state.get("scenario_constraints", state.get("competition_constraints", []))
-        )
-        path.write_text(
-            "# Brainstorm\n\n## Objective\n\n"
-            + state["objective"]
-            + "\n\n## Current State\n\nProject inspected by the deterministic rehearsal executor."
-            "\n\n## Binding Constraints\n\n"
-            + constraints
-            + "\n\n## Scope\n\nDeliver the C++ packaging customization, compatibility preservation, tool skill, and verification."
-            "\n\n## Alternatives\n\n### Option A\n\nExtend the existing header format compatibly.\n\n### Option B\n\nReplace the format contract."
-            "\n\n## Decision\n\nUse a backward-compatible header extension with explicit verification of unpack and CLI compatibility."
-            "\n\n## Risks\n\nVariable-length header parsing and backward compatibility require focused regression tests."
-            "\n\n## Blocking Ambiguities\n\nNone\n",
-            encoding="utf-8",
-        )
-        changed.append(rel(root, path))
-    elif stage == "proposal":
-        path = directory / "proposal.md"
-        path.write_text(
-            "# Change Proposal\n\n## Why\n\n"
-            + state["objective"]
-            + "\n\n## What Changes\n\nAdd parameter-driven custom header payload support, preserve unpack and legacy CLI behavior, and deliver a callable tool skill."
-            "\n\n## Capabilities\n\n### New Capabilities\n\n- `custom-header-payload`: write variable-length custom header content into the package output.\n- `header-inspection-skill`: inspect header metadata and support THX-related handling through the delivered skill."
-            "\n\n### Modified Capabilities\n\n- Existing pack/unpack flow to parse and preserve customized header payloads.\n\n## Impact\n\nProduction code, tests, and tool skill assets only; no build entrypoint change and no dependency expansion.\n",
-            encoding="utf-8",
-        )
-        changed.append(rel(root, path))
-    elif stage == "specs":
-        path = directory / "specs" / "custom-header-payload" / "spec.md"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            "## ADDED Requirements\n\n"
-            "### Requirement: Support parameter-driven custom header payload\n\n"
-            "The packaging tool MUST accept a parameter that supplies custom header payload content.\n\n"
-            "#### Scenario: Pack with variable-length custom header payload\n\n"
-            "- **WHEN** the caller provides custom header payload content of arbitrary supported length\n"
-            "- **THEN** the package output stores that payload without corrupting the archive structure\n\n"
-            "### Requirement: Preserve unpack correctness and compatibility\n\n"
-            "The system MUST unpack both legacy and customized package outputs correctly.\n\n"
-            "#### Scenario: Unpack customized package\n\n"
-            "- **WHEN** a package contains customized header payload content\n"
-            "- **THEN** unpack succeeds and restores the original packaged content\n\n"
-            "#### Scenario: Legacy invocation remains valid\n\n"
-            "- **WHEN** the original pack command is executed without the new parameter\n"
-            "- **THEN** behavior remains compatible with the legacy tool contract\n",
-            encoding="utf-8",
-        )
-        changed.append(rel(root, path))
-    elif stage == "design":
-        path = directory / "design.md"
-        path.write_text(
-            "# Technical Design\n\n## Context\n\nThe target C++ packaging project must support custom header payload customization under the active scenario constraints."
-            "\n\n## Goals\n\nImplement parameter-driven variable-length header payload support, preserve unpack correctness, preserve legacy entrypoints, and deliver the tool skill."
-            "\n\n## Non-Goals\n\nNo build entrypoint change, no dependency expansion, no broad format redesign."
-            "\n\n## Existing API Verification\n\n| API | Source | Result |\n|---|---|---|\n| protected surface | baseline | unchanged |"
-            "\n\n## Architecture and Boundaries\n\nKeep implementation within existing pack/unpack, CLI parsing, and test directories plus the delivered skill asset."
-            "\n\n## Decisions\n\nUse a backward-compatible header extension with explicit length-aware parsing and fallback-safe legacy behavior."
-            "\n\n## Testing Strategy\n\nRun focused checks for variable-length header payloads, customized unpack, legacy CLI invocation, and skill-observable header inspection.\n",
-            encoding="utf-8",
-        )
-        changed.append(rel(root, path))
-    elif stage == "tasks":
-        path = directory / "tasks.md"
-        path.write_text(
-            "# Tasks\n\n## 1. Implementation\n\n"
-            "- [ ] 1.1 Implement parameter-driven variable-length custom header payload support with focused tests\n"
-            "- [ ] 1.2 Preserve unpack correctness, original CLI compatibility, and unchanged build entrypoint with regression tests\n"
-            "- [ ] 1.3 Deliver the tool skill for THX-related handling and header inspection, and verify end-to-end behavior\n",
-            encoding="utf-8",
-        )
-        changed.append(rel(root, path))
-    elif stage == "plan":
-        path = directory / "plan.md"
-        path.write_text(
-            "# Execution Plan\n\n## Execution Strategy\n\nUse one isolated session per task."
-            "\n\n## Tasks\n\n"
-            "### Task 1.1\n\n"
-            "- Theme: custom header payload, variable-length header payload\n"
-            "- Verification: run focused custom-header pack checks and variable-length payload regression\n"
-            "- Evidence: implementation diff, focused test output, and header-related validation logs\n"
-            "- Implementation Targets: src/pack, src/header\n"
-            "- Test Targets: tests/header, tests/pack\n\n"
-            "### Task 1.2\n\n"
-            "- Theme: unpack correctness, legacy CLI compatibility, unchanged build entrypoint\n"
-            "- Verification: run customized unpack regression and original CLI compatibility checks\n"
-            "- Evidence: unpack test output, compatibility test output, and build-entry stability proof\n"
-            "- Implementation Targets: src/unpack, src/cli\n"
-            "- Test Targets: tests/unpack, tests/compatibility\n\n"
-            "### Task 1.3\n\n"
-            "- Theme: skill delivery, THX handling, header inspection\n"
-            "- Verification: run skill invocation checks for THX/header inspection and end-to-end tool behavior\n"
-            "- Evidence: delivered skill files, skill invocation output, and end-to-end validation logs\n"
-            "- Implementation Targets: skill/cpp-unitool-header, src/inspection\n"
-            "- Test Targets: tests/skill, tests/inspection"
-            "\n\n## Verification\n\nRun focused checks for custom-header pack, customized unpack, legacy CLI compatibility, unchanged build entrypoint, and skill behavior."
-            "\n\n## Checkpoint Strategy\n\nCommit after each passing deterministic gate.\n",
-            encoding="utf-8",
-        )
-        changed.append(rel(root, path))
-    elif stage == "apply":
+    if stage == "apply":
+        try:
+            profile_name = str(state.get("scenario_profile") or DEFAULT_PROFILE.name)
+            active_profile = get_profile(profile_name)
+        except (ValueError, KeyError):
+            active_profile = DEFAULT_PROFILE
+        # apply stage uses code-based logic for task-specific file creation and evidence
         task = current_task(root, state)
         if task["id"] == "1.1":
             impl = root / "src" / "pack" / "header_payload_fixture.txt"
@@ -2701,89 +2869,125 @@ def fixture_execute(root: Path, state: dict[str, Any]) -> None:
         test.write_text(f"deterministic scenario rehearsal test task {task['id']} completed\n", encoding="utf-8")
         changed.extend([rel(root, impl), rel(root, test)])
         if task["id"] == "1.1":
-            requirement_evidence = [
-                {
-                    "requirement": "Support parameter-driven custom header payload with variable-length header content",
-                    "implementation_files": [rel(root, impl)],
-                    "test_files": [rel(root, test)],
-                    "status": "satisfied",
-                }
-            ]
+            requirement_evidence = (
+                [
+                    {
+                        "requirement": "Support parameter-driven custom header payload with variable-length header content",
+                        "implementation_files": [rel(root, impl)],
+                        "test_files": [rel(root, test)],
+                        "status": "satisfied",
+                    },
+                    {
+                        "requirement": "Documentation of the custom header payload feature and verification approach",
+                        "implementation_files": [],
+                        "test_files": [],
+                        "status": "satisfied",
+                    },
+                ]
+                if active_profile.name == COMPETITION_PROFILE.name
+                else [
+                    {
+                        "requirement": "Implement the requested behavior change with focused verification evidence",
+                        "implementation_files": [rel(root, impl)],
+                        "test_files": [rel(root, test)],
+                        "status": "satisfied",
+                    },
+                    {
+                        "requirement": "Documentation of the requested behavior change and verification evidence",
+                        "implementation_files": [],
+                        "test_files": [],
+                        "status": "satisfied",
+                    },
+                ]
+            )
         elif task["id"] == "1.2":
-            requirement_evidence = [
-                {
-                    "requirement": "Preserve unpack correctness for customized packages",
-                    "implementation_files": [rel(root, impl)],
-                    "test_files": [rel(root, test)],
-                    "status": "satisfied",
-                },
-                {
-                    "requirement": "Preserve legacy CLI compatibility and unchanged build entrypoint",
-                    "implementation_files": [rel(root, impl)],
-                    "test_files": [rel(root, test)],
-                    "status": "satisfied",
-                },
-            ]
+            requirement_evidence = (
+                [
+                    {
+                        "requirement": "Preserve existing behavior for unpack correctness and customized packages",
+                        "implementation_files": [rel(root, impl)],
+                        "test_files": [rel(root, test)],
+                        "status": "satisfied",
+                    },
+                    {
+                        "requirement": "Preserve legacy CLI compatibility and unchanged build entrypoint",
+                        "implementation_files": [rel(root, impl)],
+                        "test_files": [rel(root, test)],
+                        "status": "satisfied",
+                    },
+                    {
+                        "requirement": "Documentation of compatibility preservation and test evidence",
+                        "implementation_files": [],
+                        "test_files": [],
+                        "status": "satisfied",
+                    },
+                ]
+                if active_profile.name == COMPETITION_PROFILE.name
+                else [
+                    {
+                        "requirement": "Preserve existing behavior with regression verification evidence",
+                        "implementation_files": [rel(root, impl)],
+                        "test_files": [rel(root, test)],
+                        "status": "satisfied",
+                    },
+                    {
+                        "requirement": "Document existing behavior preservation and regression verification evidence",
+                        "implementation_files": [],
+                        "test_files": [],
+                        "status": "satisfied",
+                    },
+                ]
+            )
         else:
             requirement_evidence = [
-                {
-                    "requirement": "Deliver the tool skill for THX handling and header inspection",
-                    "implementation_files": [rel(root, impl)],
-                    "test_files": [rel(root, test)],
-                    "status": "satisfied",
-                }
+                *(
+                    [
+                        {
+                            "requirement": "Deliver the tool skill for THX handling and header inspection",
+                            "implementation_files": [rel(root, impl)],
+                            "test_files": [rel(root, test)],
+                            "status": "satisfied",
+                        },
+                        {
+                            "requirement": "Documentation of skill delivery and verification evidence",
+                            "implementation_files": [],
+                            "test_files": [],
+                            "status": "satisfied",
+                        },
+                    ]
+                    if active_profile.name == COMPETITION_PROFILE.name
+                    else [
+                        {
+                            "requirement": "Verify the requested behavior end-to-end with concrete evidence",
+                            "implementation_files": [rel(root, impl)],
+                            "test_files": [rel(root, test)],
+                            "status": "satisfied",
+                        },
+                        {
+                            "requirement": "Documentation of end-to-end verification evidence for the requested behavior",
+                            "implementation_files": [],
+                            "test_files": [],
+                            "status": "satisfied",
+                        },
+                    ]
+                ),
             ]
-    elif stage == "verify":
-        path = directory / "verify.md"
-        path.write_text(
-            "# Verification Report\n\n## Structural Validation\n\nPASS"
-            "\n\n## Requirement Traceability\n\nVariable-length custom header payload, unpack correctness, legacy CLI compatibility, unchanged build entrypoint, and skill/header inspection evidence are mapped."
-            "\n\n## Protected API and Scope\n\nPASS"
-            "\n\n## Dependency Integrity\n\nPASS"
-            "\n\n## Quality Gates\n\nConfigured commands are executed by the Runner. Custom header payload, unpack, compatibility, and skill checks are covered."
-            "\n\n## Findings\n\nNone"
-            "\n\n## Decision\n\nPASS\n",
-            encoding="utf-8",
-        )
-        changed.append(rel(root, path))
-    elif stage == "review":
-        path = directory / "review.md"
-        path.write_text(
-            "# Independent Code Review\n\n## Scope Compliance\n\nPASS"
-            "\n\n## Specification Compliance\n\nPASS"
-            "\n\n## Clean Code Review\n\nPASS"
-            "\n\n## Test Quality\n\nPASS"
-            "\n\n## Findings\n\nNo blocking findings."
-            "\n\n## Decision\n\nPASS\n",
-            encoding="utf-8",
-        )
-        changed.append(rel(root, path))
-    elif stage == "finalize":
-        path = directory / "finalize.md"
-        path.write_text(
-            "# Finalize Receipt\n\n## Outcome\n\nPASS"
-            "\n\n## Repository State\n\nReady for deterministic archive."
-            "\n\n## Evidence\n\nSee `.sdd/evidence/` and stage handoffs."
-            "\n\n## Residual Risks\n\nNone\n\n## Archive Authorization\n\nAUTHORIZED\n",
-            encoding="utf-8",
-        )
-        changed.append(rel(root, path))
-    elif stage == "retrospective":
-        path = sdd_dir(root) / "changes" / state["change_id"] / "retrospective.md"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            "# Retrospective\n\n## Delivered Outcome\n\nThe complete autonomous lifecycle closed."
-            "\n\n## Planned Path vs Actual Path\n\nThe deterministic path matched the lifecycle."
-            "\n\n## Failures and Recoveries\n\nNone."
-            "\n\n## Agent Compliance\n\nAll stage boundaries and handoffs were observed."
-            "\n\n## Quality Findings\n\nNo blocking findings."
-            "\n\n## Remaining Risks\n\nReal-model behavior remains for later validation."
-            "\n\n## Workflow Improvements\n\nUse this rehearsal as the control baseline.\n",
-            encoding="utf-8",
-        )
-        changed.append(rel(root, path))
     else:
-        raise SddError(f"Fixture executor cannot execute stage: {stage}")
+        # All other stages use profile-scoped templates with parameterization
+        template = _resolve_fixture_template(state, stage)
+        if template is None:
+            raise SddError(f"Fixture executor cannot execute stage: {stage}")
+        constraints = _format_fixture_constraints(state)
+        content = template.format(objective=state["objective"], constraints=constraints)
+        if stage == "retrospective":
+            path = sdd_dir(root) / "changes" / state["change_id"] / "retrospective.md"
+        elif stage == "specs":
+            path = directory / "specs" / "generic-spec" / "spec.md"
+        else:
+            path = directory / f"{stage}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        changed.append(rel(root, path))
     task = current_task(root, state) if stage == "apply" else None
     write_agent_result(
         root,
@@ -2852,11 +3056,13 @@ def invoke_agent(root: Path, state: dict[str, Any], dry_run: bool) -> None:
         fixture_execute(root, state)
         append_journal(root, {"event": "fixture_finished", "stage": state["stage"]})
         return
+    execution_mode = str(state.get("stage_execution_mode") or stage_execution_mode(config))
+    agent_name = STAGE_EXECUTION_AGENT_NAMES[execution_mode]
     command = [
         "opencode",
         "run",
         "--agent",
-        STAGE_AGENT_NAME,
+        agent_name,
         "--format",
         "json",
         "--dir",
@@ -2870,7 +3076,13 @@ def invoke_agent(root: Path, state: dict[str, Any], dry_run: bool) -> None:
         command[2:2] = ["--model", model]
     timeout = agent_timeout_for_state(root, state)
     try:
-        result = run_command(command, root, timeout=timeout)
+        result = run_command(
+            command,
+            root,
+            timeout=timeout,
+            result_path=result_path,
+            result_grace_seconds=AGENT_RESULT_GRACE_SECONDS,
+        )
     except subprocess.TimeoutExpired as exc:
         timed_out = subprocess.CompletedProcess(
             command,
@@ -2892,8 +3104,25 @@ def invoke_agent(root: Path, state: dict[str, Any], dry_run: bool) -> None:
     evidence = write_evidence(root, f"{state['stage']}-{state['iteration']}-agent", command, result)
     append_journal(
         root,
-        {"event": "agent_finished", "stage": state["stage"], "exit_code": result.returncode, "evidence": evidence},
+        {
+            "event": "agent_finished",
+            "stage": state["stage"],
+            "execution_mode": execution_mode,
+            "agent": agent_name,
+            "exit_code": result.returncode,
+            "evidence": evidence,
+        },
     )
+    if "[RESULT_FILE_GRACE_EXIT]" in (result.stdout or ""):
+        append_journal(
+            root,
+            {
+                "event": "agent_exit_recovered_from_result_file",
+                "stage": state["stage"],
+                "result_path": rel(root, result_path),
+                "grace_seconds": AGENT_RESULT_GRACE_SECONDS,
+            },
+        )
     if result.returncode != 0:
         raise SddError(f"OpenCode invocation failed; see {evidence}")
 
@@ -3035,7 +3264,7 @@ def execute_gates(root: Path, state: dict[str, Any]) -> tuple[list[str], list[di
         try:
             agent_result = load_json(result_path)
             errors.extend(validate_agent_result(root, state, agent_result))
-            errors.extend(validate_competition_requirement_coverage(root, state, agent_result))
+            errors.extend(validate_profile_requirement_coverage(root, state, agent_result))
             errors.extend(validate_plan_commitment_coverage(root, state, agent_result))
             if agent_result.get("status") != "completed":
                 errors.append(f"Agent result status is not completed: {agent_result.get('status')}")
@@ -3080,8 +3309,7 @@ def execute_gates(root: Path, state: dict[str, Any]) -> tuple[list[str], list[di
             commands.extend(focused)
             errors.extend(focused_errors)
         for index, command in enumerate(commands):
-            if command and command[0] == "openspec.cmd" and os.name != "nt":
-                command = ["openspec", *command[1:]]
+            command = resolve_runtime_command(root, command)
             timeout_key = "focused_test_seconds" if stage == "apply" and index >= len(verification_commands(root, stage)) else "verification_seconds"
             timeout = load_config(root)["timeouts"].get(timeout_key, load_config(root)["timeouts"]["verification_seconds"])
             result = run_command(command, root, timeout=timeout)
@@ -3099,6 +3327,7 @@ def write_handoff(
     next_stage: str,
     evidence: list[dict[str, Any]],
     soft_findings: list[str] | None = None,
+    blocking_findings: list[str] | None = None,
 ) -> Path:
     handoff_dir = sdd_dir(root) / "runtime" / "handoffs"
     handoff_dir.mkdir(parents=True, exist_ok=True)
@@ -3123,7 +3352,7 @@ def write_handoff(
         "artifacts": artifacts,
         "evidence": evidence,
         "requirement_evidence": agent_result.get("requirement_evidence", []),
-        "blocking_findings": [],
+        "blocking_findings": list(blocking_findings or []),
         "soft_findings": list(soft_findings or []),
         "open_findings": list(state.get("open_findings", [])),
         "residual_risks": list(agent_result.get("residual_risks", []))
@@ -3223,11 +3452,34 @@ def force_closeout(
     return state
 
 
+def defer_hard_gate_findings(
+    root: Path,
+    state: dict[str, Any],
+    hard_errors: list[str],
+    *,
+    task_id: str | None = None,
+) -> None:
+    deferred_to = "verify" if state.get("stage") == "apply" else next_stage_after(root, state)
+    records = finding_records(state["stage"], hard_errors, deferred_to=deferred_to, task_id=task_id)
+    merge_open_findings(state, records)
+    append_journal(
+        root,
+        {
+            "event": "gate_hard_findings_deferred",
+            "stage": state["stage"],
+            "task_id": task_id,
+            "errors": hard_errors,
+            "deferred_to": deferred_to,
+        },
+    )
+
+
 def gate_and_advance(root: Path) -> None:
     state = load_state(root)
     completed_task = current_task(root, state) if state["stage"] == "apply" else None
     errors, evidence = execute_gates(root, state)
     hard_errors, soft_errors = split_gate_findings(state["stage"], errors)
+    deferred_hard_errors: list[str] = []
     if soft_errors:
         merge_open_findings(state, finding_records(state["stage"], soft_errors, deferred_to="verify"))
         append_journal(root, {"event": "gate_soft_findings_recorded", "stage": state["stage"], "errors": soft_errors})
@@ -3240,41 +3492,46 @@ def gate_and_advance(root: Path) -> None:
         append_journal(root, {"event": "gate_failed", "stage": key, "errors": hard_errors, "soft_errors": soft_errors})
         maximum = stage_retry_budget(root)
         if state["retries"][key] > maximum:
-            force_closeout(
-                root,
-                state,
-                trigger="gate_retry_budget_exhausted",
-                reason=f"Gate retry budget exhausted at stage {key}",
-                gate_errors=hard_errors,
-                recovery_actions=[
-                    "Stopped retrying the same gate after retry budget exhaustion.",
-                    "Recorded current gate errors for scoring and downstream review.",
-                    "Emitted final delivery report and receipt instead of leaving the run mid-flight.",
-                ],
-            )
-            print(f"FORCED_CLOSE {key} -> {terminal_outcome(load_state(root))}")
-            return
-        raise SddError("Gate failed:\n- " + "\n- ".join(hard_errors))
+            defer_hard_gate_findings(root, state, hard_errors, task_id=completed_task["id"] if completed_task else None)
+            deferred_hard_errors = list(hard_errors)
+            hard_errors = []
+        if hard_errors:
+            raise SddError("Gate failed:\n- " + "\n- ".join(hard_errors))
     if completed_task:
         complete_task(root, state, completed_task["id"])
         state.pop("task", None)
-        append_journal(
-            root,
-            {"event": "apply_task_completed", "task_id": completed_task["id"], "title": completed_task["title"]},
-        )
+        if deferred_hard_errors:
+            append_journal(
+                root,
+                {
+                    "event": "apply_task_deferred",
+                    "task_id": completed_task["id"],
+                    "title": completed_task["title"],
+                    "errors": deferred_hard_errors,
+                },
+            )
+        else:
+            append_journal(
+                root,
+                {"event": "apply_task_completed", "task_id": completed_task["id"], "title": completed_task["title"]},
+            )
     completed = state["stage"]
     next_stage = next_stage_after(root, state)
     reconcile_open_findings(state, completed)
-    handoff = write_handoff(root, state, completed, next_stage, evidence, soft_findings=soft_errors)
-    if next_stage == "closed":
-        preview = dict(state)
-        preview["status"] = "closed"
-        emit_final_report(root, preview)
+    handoff = write_handoff(
+        root,
+        state,
+        completed,
+        next_stage,
+        evidence,
+        soft_findings=soft_errors,
+        blocking_findings=deferred_hard_errors,
+    )
     commit = checkpoint(root, state, completed)
     state["stage"] = next_stage
     state["status"] = "closed" if next_stage == "closed" else "running"
     if next_stage == "closed":
-        state["terminal_outcome"] = "closed_pass"
+        state["terminal_outcome"] = "closed_with_findings" if state.get("open_findings") else "closed_pass"
     else:
         state.pop("terminal_outcome", None)
     if next_stage == "apply":
@@ -3292,6 +3549,8 @@ def gate_and_advance(root: Path) -> None:
     state.pop("forced_closeout", None)
     clear_failure_signature(root, state, completed)
     save_state(root, state)
+    if next_stage == "closed":
+        emit_final_report(root, state)
     append_journal(root, {"event": "stage_advanced", "from": completed, "to": next_stage, "commit": commit})
     print(f"PASS {completed} -> {next_stage} at {commit}")
 
@@ -3423,9 +3682,13 @@ def emit_final_report(root: Path, state: dict[str, Any]) -> Path:
         "The persisted state, archive, handoffs, and configured gates completed consistently."
         if terminal_outcome(state) == "closed_pass"
         else (
-            "The run was force-closed with best-effort scoring evidence after automated recovery limits were reached."
-            if state["status"] == "closed"
-            else f"The run stopped safely. Blocking reason: `{state.get('blocking_reason', 'unknown')}`."
+            "The run completed and emitted final delivery artifacts, but unresolved findings remain for follow-up."
+            if terminal_outcome(state) == "closed_with_findings"
+            else (
+                "The run was force-closed with best-effort scoring evidence after automated recovery limits were reached."
+                if state["status"] == "closed"
+                else f"The run stopped safely. Blocking reason: `{state.get('blocking_reason', 'unknown')}`."
+            )
         )
     )
     report.write_text(
@@ -3462,7 +3725,7 @@ def emit_final_report(root: Path, state: dict[str, Any]) -> Path:
             "resolved_findings": resolved_findings,
             "forced_closeout": forced if isinstance(forced, dict) else {},
             "score_signals": {
-                "completed_lifecycle": terminal_outcome(state) == "closed_pass",
+                "completed_lifecycle": terminal_outcome(state) in {"closed_pass", "closed_with_findings"},
                 "forced_closeout_used": bool(forced),
                 "best_effort_result_available": state["status"] == "closed",
             },
@@ -3843,7 +4106,7 @@ def parser() -> argparse.ArgumentParser:
 
     autorecover_cmd = sub.add_parser("autorecover", help="Recover a run and execute safe automatic recovery steps")
     autorecover_cmd.add_argument("--dry-run", action="store_true")
-    autorecover_cmd.add_argument("--retry-seconds", type=float, default=0)
+    autorecover_cmd.add_argument("--retry-seconds", type=float, default=15)
     autorecover_cmd.set_defaults(func=autorecover)
 
     rehearse_recovery_cmd = sub.add_parser(
