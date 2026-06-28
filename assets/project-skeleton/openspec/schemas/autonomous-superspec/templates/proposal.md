@@ -2,25 +2,23 @@
 
 ## Why
 
-Describe how the target C++ packaging project will add parameter-driven custom header payload support while preserving compatibility and unpack correctness.
+Describe the requested change, why it matters, and what user-visible or system-visible behavior should result.
 
 ## What Changes
 
-- Extend pack flow to accept custom header payload input.
-- Extend unpack flow to parse variable-length customized headers.
-- Preserve legacy CLI usage and build entrypoints.
-- Deliver a callable skill for THX/header inspection.
+- Implement the requested behavior inside approved paths.
+- Preserve unaffected public behavior and existing contracts.
+- Record any host or project skill dependency as a runtime capability, not as a bundled deliverable.
 
 ## Capabilities
 
 ### New Capabilities
 
-- `custom-header-payload`: parameter-driven variable-length header customization
-- `header-inspection-skill`: THX/header inspection support through the delivered skill
+- Describe any newly introduced behavior in task-specific terms.
 
 ### Modified Capabilities
 
-- existing pack/unpack behavior for compatibility-preserving header parsing
+- Describe any existing behavior that must change while remaining controlled and verifiable.
 
 ## Impact
 
@@ -30,4 +28,4 @@ Describe how the target C++ packaging project will add parameter-driven custom h
 
 ### Dependencies
 
-No dependency changes unless competition policy explicitly authorizes them.
+No dependency changes unless repository policy explicitly authorizes them.

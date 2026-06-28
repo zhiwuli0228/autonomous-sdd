@@ -100,8 +100,8 @@ class RunnerSmokeTest(unittest.TestCase):
         self.assertIn("context_summary", packet)
         self.assertIn("required_artifacts", packet)
         self.assertIn("metadata", packet)
-        self.assertEqual("competition-cpp-header-payload", packet["metadata"]["scenario_profile"])
-        self.assertEqual("competition-cpp-header-payload", packet["scenario_profile"])
+        self.assertEqual("generic-hosted", packet["metadata"]["scenario_profile"])
+        self.assertEqual("generic-hosted", packet["scenario_profile"])
         self.assertIn("scenario_constraints", packet)
         self.assertIn("required_outcomes", packet)
         self.assertIn("scenario_tooling_constraints", packet)
@@ -113,7 +113,7 @@ class RunnerSmokeTest(unittest.TestCase):
         self.assertEqual("opencode-default", state["model_selection"])
         self.assertEqual("inline", state["objective_source"])
         self.assertEqual("inline", state["scenario_objective_source"])
-        self.assertEqual("competition-cpp-header-payload", state["scenario_profile"])
+        self.assertEqual("generic-hosted", state["scenario_profile"])
         self.assertEqual(state["scenario_constraints"], state["competition_constraints"])
         self.assertEqual(state["required_outcomes"], state["required_acceptance_invariants"])
         objective_bundle = json.loads(
@@ -155,7 +155,7 @@ class RunnerSmokeTest(unittest.TestCase):
         run("--project", str(self.project), "baseline")
         with (
             mock.patch.object(SDD, "run_loop") as run_loop,
-            mock.patch.object(SDD, "finalize_competition_run", return_value={"status": "closed"}),
+            mock.patch.object(SDD, "finalize_hosted_run", return_value={"status": "closed"}),
         ):
             SDD.compete(
                 argparse.Namespace(
@@ -176,7 +176,7 @@ class RunnerSmokeTest(unittest.TestCase):
         run("--project", str(self.project), "baseline")
         with (
             mock.patch.object(SDD, "run_loop") as run_loop,
-            mock.patch.object(SDD, "finalize_competition_run", return_value={"status": "closed"}) as finalize,
+            mock.patch.object(SDD, "finalize_hosted_run", return_value={"status": "closed"}) as finalize,
         ):
             SDD.compete(
                 argparse.Namespace(
@@ -191,10 +191,10 @@ class RunnerSmokeTest(unittest.TestCase):
         finalize.assert_called_once()
         active_root = Path(run_loop.call_args.args[0].project)
         state = json.loads((active_root / ".sdd" / "runtime" / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(SDD.DEFAULT_COMPETITION_GOAL, state["objective"])
+        self.assertEqual(SDD.DEFAULT_SCENARIO_GOAL, state["objective"])
         self.assertEqual("default", state["objective_source"])
         self.assertEqual("default", state["scenario_objective_source"])
-        self.assertEqual("competition-cpp-header-payload", state["scenario_profile"])
+        self.assertEqual("generic-hosted", state["scenario_profile"])
 
     def test_apply_packet_includes_current_task_contract(self) -> None:
         run("--project", str(self.project), "baseline")
@@ -473,7 +473,7 @@ class RunnerSmokeTest(unittest.TestCase):
         (work_root / ".sdd" / "config.yaml").write_text(json.dumps(work_config, indent=2) + "\n", encoding="utf-8")
         with (
             mock.patch.object(SDD, "run_loop") as run_loop,
-            mock.patch.object(SDD, "finalize_competition_run", return_value={"status": "closed"}) as finalize,
+            mock.patch.object(SDD, "finalize_hosted_run", return_value={"status": "closed"}) as finalize,
             mock.patch.object(SDD, "create_runtime_services") as create_services,
         ):
             SDD.compete(
@@ -530,7 +530,7 @@ class RunnerSmokeTest(unittest.TestCase):
         state["last_verified_commit"] = SDD.git_head(root)
         SDD.save_state(root, state)
 
-        final = SDD.finalize_competition_run(root, self.project)
+        final = SDD.finalize_hosted_run(root, self.project)
 
         self.assertEqual("blocked", final["status"])
         self.assertIn("Source workspace changed since run started", final["blocking_reason"])
@@ -583,7 +583,7 @@ class RunnerSmokeTest(unittest.TestCase):
         state["last_verified_commit"] = SDD.git_head(root)
         SDD.save_state(root, state)
 
-        final = SDD.finalize_competition_run(root, self.project)
+        final = SDD.finalize_hosted_run(root, self.project)
 
         self.assertEqual("closed", final["status"])
         self.assertFalse((self.project / ".sdd" / "runtime" / "active-run.json").exists())
@@ -1971,7 +1971,7 @@ class RunnerSmokeTest(unittest.TestCase):
         }
         errors = SDD.validate_apply_task_requirement_alignment(
             self.project,
-            {"stage": "apply"},
+            {"stage": "apply", "scenario_profile": "competition-cpp-header-payload"},
             task,
             [
                 {
@@ -1991,7 +1991,7 @@ class RunnerSmokeTest(unittest.TestCase):
         }
         errors = SDD.validate_apply_task_requirement_alignment(
             self.project,
-            {"stage": "apply"},
+            {"stage": "apply", "scenario_profile": "competition-cpp-header-payload"},
             task,
             [
                 {
@@ -2015,7 +2015,7 @@ class RunnerSmokeTest(unittest.TestCase):
         (skill / "SKILL.md").write_text("THX header inspection with custom header examples\n", encoding="utf-8")
         errors = SDD.validate_apply_task_requirement_alignment(
             self.project,
-            {"stage": "apply"},
+            {"stage": "apply", "scenario_profile": "competition-cpp-header-payload"},
             task,
             [
                 {
@@ -2078,7 +2078,7 @@ class RunnerSmokeTest(unittest.TestCase):
         }
         errors = SDD.validate_apply_task_requirement_alignment(
             self.project,
-            {"stage": "apply"},
+            {"stage": "apply", "scenario_profile": "competition-cpp-header-payload"},
             task,
             [
                 {

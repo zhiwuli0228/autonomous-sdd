@@ -18,6 +18,7 @@ from .services import RuntimeServices, create_runtime_services
 from .workspace import RunWorkspace, create_run_context, default_run_root
 from .profiles import (
     COMPETITION_PROFILE,
+    DEFAULT_PROFILE,
     GENERIC_HOSTED_PROFILE,
     PROFILE_REGISTRY,
     ScenarioProfile,
@@ -49,6 +50,7 @@ __all__ = [
     "RuntimeServices",
     "RunWorkspace",
     "COMPETITION_PROFILE",
+    "DEFAULT_PROFILE",
     "GENERIC_HOSTED_PROFILE",
     "PROFILE_REGISTRY",
     "ScenarioProfile",

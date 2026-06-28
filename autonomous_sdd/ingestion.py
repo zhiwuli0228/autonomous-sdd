@@ -13,7 +13,7 @@ from .paths import canonical_path, resolve_beneath
 from .repository import Repository
 
 
-BASELINE_COMMIT_MESSAGE = "chore: capture competition input baseline"
+BASELINE_COMMIT_MESSAGE = "chore: capture hosted run input baseline"
 
 def prepare_input_workspace(source_root: Path, work_root: Path, run_id: str) -> InputWorkspaceSnapshot:
     source = Repository(source_root)

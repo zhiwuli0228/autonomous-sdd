@@ -1,7 +1,7 @@
 schema: autonomous-superspec
 
 context: |
-  This repository uses an unattended, single-workspace competition workflow.
+  This repository uses an unattended, single-workspace hosted SDD workflow.
   Dynamic authority comes only from .sdd/runtime/state.json.
   Conversation history is not authoritative.
   Agents do not advance lifecycle state, commit, or alter policy.

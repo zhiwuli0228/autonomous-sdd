@@ -8,32 +8,32 @@ only lifecycle writer.
 ## Tasks
 
 Theme rules:
-- Every `Theme` line must list all competition topics implied by that task's title and detail bullets, not only the primary implementation headline.
-- If a task mentions custom headers, variable-length payloads, unpack behavior, original CLI compatibility, unchanged build entrypoint, skill delivery, THX handling, or header inspection anywhere in the task body, repeat those topics explicitly in `Theme`.
+- Every `Theme` line must list all material requirements implied by that task's title and detail bullets, not only the primary implementation headline.
+- If a task mentions behavior preservation, verification evidence, documentation, or routed skill usage anywhere in the task body, repeat those topics explicitly in `Theme`.
 - Keep `Verification`, `Evidence`, `Implementation Targets`, and `Test Targets` concrete and file-oriented.
 
 ### Task 1.1
 
-- Theme: custom header payload, variable-length header payload, unpack correctness
-- Verification: run the specific custom-header regression binary or command and confirm the targeted custom_header roundtrip behavior passes with exit code 0
-- Evidence: focused test output plus the exact changed test file paths that prove custom_header roundtrip and variable-length payload coverage
-- Implementation Targets: tests/unit/test_format.cpp
-- Test Targets: tests/unit/test_format.cpp
+- Theme: requested behavior, focused verification
+- Verification: run the exact command or test that proves the task-specific behavior with exit code 0
+- Evidence: focused command output plus exact changed file paths tied to the verified behavior
+- Implementation Targets: src/example.py
+- Test Targets: tests/test_example.py
 
 ### Task 1.2
 
-- Theme: custom header payload, unpack correctness, legacy CLI compatibility, unchanged build entrypoint
-- Verification: run the exact unpack and CLI regression targets and confirm customized unpack, original CLI behavior, and build entry stability all pass
-- Evidence: unpack regression output, CLI regression output, and file-level proof tied to the changed integration test paths
-- Implementation Targets: tests/integration/test_integration.cpp, tests/integration/test_cli.cpp
-- Test Targets: tests/integration/test_integration.cpp, tests/integration/test_cli.cpp
+- Theme: behavior preservation, regression coverage
+- Verification: run the exact regression command or test that proves unaffected behavior remains intact
+- Evidence: regression output plus exact changed file paths tied to preserved behavior
+- Implementation Targets: src/example.py, tests/test_example.py
+- Test Targets: tests/test_example.py
 
 ### Task 1.3
 
-- Theme: custom header payload, skill delivery, THX handling, header inspection
-- Verification: review the exact skill file content and confirm THX/header inspection guidance, custom_header behavior, and usage examples are present
-- Evidence: updated skill file path plus content review proof for THX handling and header inspection sections
-- Implementation Targets: skills/unitool/SKILL.md
+- Theme: documentation or routed skill usage, verification evidence
+- Verification: review the exact documentation, configuration, or skill-routed behavior needed by the task and confirm it is complete
+- Evidence: updated file paths or execution output that prove the remaining scope is complete
+- Implementation Targets: README.md
 - Test Targets: None (documentation-only change)
 
 ## Verification

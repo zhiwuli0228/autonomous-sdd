@@ -4,11 +4,9 @@
 
 ## Goals
 
-- Support parameter-driven custom header payload content.
-- Support variable-length header payload parsing.
-- Preserve unpack correctness and legacy CLI compatibility.
-- Keep the build entrypoint unchanged.
-- Deliver the tool skill and validating tests.
+- Implement the requested scoped behavior.
+- Preserve unaffected public behavior and repository contracts.
+- Keep verification concrete and repeatable.
 
 ## Non-Goals
 
@@ -37,15 +35,14 @@
 
 ## Concurrency and Resource Ownership
 
-## Security and Competition Constraints
+## Security and Repository Constraints
 
 ## Testing Strategy
 
 | Requirement/Scenario | Test level | Planned test |
 |---|---|---|
-| variable-length custom header payload | unit/integration | pack with multiple payload lengths |
-| unpack customized package | integration | unpack customized archive and validate output |
-| legacy CLI compatibility | regression | run original parameters without customization |
-| skill-observable header inspection | tool/integration | invoke delivered skill against packaged artifacts |
+| requested behavior | unit/integration/regression | name the exact command or test that proves it |
+| preserved public behavior | regression | name the exact command or test that proves no regression |
+| routed skill usage when applicable | tool/integration | prove the selected host or project skill was used correctly |
 
 ## Risks and Mitigations

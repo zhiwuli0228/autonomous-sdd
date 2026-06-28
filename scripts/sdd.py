@@ -3,7 +3,7 @@
 
 The runner intentionally uses only the Python standard library. Files ending in
 .yaml are JSON-compatible YAML so they can be parsed deterministically without
-installing dependencies on a competition machine.
+installing extra dependencies on a restricted execution machine.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ _add_repo_root_to_sys_path()
 from autonomous_sdd import StageAgentPacket, create_runtime_services
 from autonomous_sdd.profiles import (
     COMPETITION_PROFILE,
+    DEFAULT_PROFILE,
     get_profile,
     normalize_profile_text,
     registered_profiles,
@@ -60,6 +61,10 @@ DEFAULT_COMPETITION_GOAL = COMPETITION_PROFILE.default_objective
 DEFAULT_COMPETITION_CONSTRAINTS = list(COMPETITION_PROFILE.constraints)
 DEFAULT_ACCEPTANCE_INVARIANTS = list(COMPETITION_PROFILE.acceptance_invariants)
 DEFAULT_TOOLING_INTEGRATION_CONSTRAINTS = dict(COMPETITION_PROFILE.tooling_integration_constraints)
+DEFAULT_SCENARIO_GOAL = DEFAULT_PROFILE.default_objective
+DEFAULT_SCENARIO_CONSTRAINTS = list(DEFAULT_PROFILE.constraints)
+DEFAULT_SCENARIO_ACCEPTANCE_INVARIANTS = list(DEFAULT_PROFILE.acceptance_invariants)
+DEFAULT_SCENARIO_TOOLING_INTEGRATION_CONSTRAINTS = dict(DEFAULT_PROFILE.tooling_integration_constraints)
 COMPETITION_REQUIREMENT_THEMES = {
     theme: list(markers) for theme, markers in COMPETITION_PROFILE.requirement_themes.items()
 }
@@ -582,7 +587,7 @@ def init_project(args: argparse.Namespace) -> None:
     root.mkdir(parents=True, exist_ok=True)
     source = Path(__file__).resolve().parent.parent / "assets" / "project-skeleton"
     if (root / ".sdd").exists() and not args.force:
-        raise SddError(f"{root} is already initialized; use --force only before a competition run")
+        raise SddError(f"{root} is already initialized; use --force only before a hosted run")
     for legacy_relative in (
         ".opencode/skills/autonomous-sdd",
         ".sdd/skills/cpp-unitool-header",
@@ -648,7 +653,7 @@ def ensure_runtime_ignores(root: Path) -> None:
 
 def compete(args: argparse.Namespace) -> None:
     source_root = project_root(args.project)
-    scenario_profile = getattr(args, "scenario_profile", None) or COMPETITION_PROFILE.name
+    scenario_profile = getattr(args, "scenario_profile", None) or DEFAULT_PROFILE.name
     objective_bundle = resolve_scenario_objective(
         getattr(args, "task", None), source_root, scenario_profile
     )
@@ -668,10 +673,10 @@ def compete(args: argparse.Namespace) -> None:
             run_loop(argparse.Namespace(project=str(active_root), max_steps=args.max_steps))
         except Exception:
             if load_state(active_root).get("status") in {"closed", "blocked"}:
-                final = finalize_competition_run(active_root, source_root)
+                final = finalize_hosted_run(active_root, source_root)
                 raise_compete_result(active_root, final)
             raise
-        final = finalize_competition_run(active_root, source_root)
+        final = finalize_hosted_run(active_root, source_root)
         raise_compete_result(active_root, final)
         return
     ensure_git_identity(source_root)
@@ -681,9 +686,9 @@ def compete(args: argparse.Namespace) -> None:
     config["executor"] = args.executor
     save_config(source_root, config)
     if not git(source_root, "rev-parse", "--verify", "HEAD", check=False):
-        commit_all(source_root, "chore: establish competition baseline")
+        commit_all(source_root, "chore: establish hosted baseline")
     else:
-        commit_all(source_root, "chore: install autonomous competition harness")
+        commit_all(source_root, "chore: install autonomous hosted harness")
     baseline(argparse.Namespace(project=str(source_root)))
     services = create_runtime_services(source_root)
     root = None
@@ -720,7 +725,7 @@ def compete(args: argparse.Namespace) -> None:
         if root is not None and state_path(root).exists():
             state = load_state(root)
             if state.get("status") in {"closed", "blocked"}:
-                final = finalize_competition_run(root, source_root)
+                final = finalize_hosted_run(root, source_root)
                 raise_compete_result(root, final)
         elif services.workspace.run_dir.exists():
             shutil.rmtree(services.workspace.run_dir, ignore_errors=True)
@@ -728,7 +733,7 @@ def compete(args: argparse.Namespace) -> None:
         raise
     else:
         if root is not None and state_path(root).exists():
-            final = finalize_competition_run(root, source_root)
+            final = finalize_hosted_run(root, source_root)
             raise_compete_result(root, final)
 
 
@@ -799,7 +804,7 @@ def assert_compete_request_matches_active_run(
         raise SddError(f"Active run change_id mismatch: requested {change_id}, active {state.get('change_id')}")
     if state.get("objective") != objective:
         raise SddError("Active run objective does not match the requested scenario task")
-    if state.get("scenario_profile", COMPETITION_PROFILE.name) != scenario_profile:
+    if state.get("scenario_profile", DEFAULT_PROFILE.name) != scenario_profile:
         raise SddError(
             "Active run scenario profile mismatch: "
             f"requested {scenario_profile}, active {state.get('scenario_profile')}"
@@ -810,7 +815,7 @@ def assert_compete_request_matches_active_run(
     return state
 
 
-def finalize_competition_run(root: Path, source_root: Path) -> dict[str, Any]:
+def finalize_hosted_run(root: Path, source_root: Path) -> dict[str, Any]:
     state = load_state(root)
     drift = source_workspace_drift(root, state, source_root)
     if drift:
@@ -841,6 +846,10 @@ def finalize_competition_run(root: Path, source_root: Path) -> dict[str, Any]:
         save_state(source_root, state)
     clear_active_run_locator(source_root)
     return state
+
+
+def finalize_competition_run(root: Path, source_root: Path) -> dict[str, Any]:
+    return finalize_hosted_run(root, source_root)
 
 
 def source_workspace_drift(root: Path, state: dict[str, Any], source_root: Path) -> list[str]:
@@ -916,7 +925,7 @@ def compete_decision(state: dict[str, Any]) -> dict[str, str]:
                 "decision": "completed_partial",
                 "reason": state.get(
                     "blocking_reason",
-                    "Competition run closed with partial evidence after automated recovery exhausted retries.",
+                    "Hosted run closed with partial evidence after automated recovery exhausted retries.",
                 ),
                 "recommended_action": "none",
             }
@@ -925,24 +934,24 @@ def compete_decision(state: dict[str, Any]) -> dict[str, str]:
                 "decision": "completed_fail",
                 "reason": state.get(
                     "blocking_reason",
-                    "Competition run closed with failure evidence after automated recovery exhausted retries.",
+                    "Hosted run closed with failure evidence after automated recovery exhausted retries.",
                 ),
                 "recommended_action": "none",
             }
         return {
             "decision": "completed",
-            "reason": "Competition run completed and final delivery was materialized.",
+            "reason": "Hosted run completed and final delivery was materialized.",
             "recommended_action": "none",
         }
     if status == "blocked":
         return {
             "decision": "blocked",
-            "reason": state.get("blocking_reason", "Competition run stopped in a blocked state."),
+            "reason": state.get("blocking_reason", "Hosted run stopped in a blocked state."),
             "recommended_action": "manual_repair",
         }
     return {
         "decision": "manual_review",
-        "reason": f"Competition run ended in unexpected status: {status}",
+        "reason": f"Hosted run ended in unexpected status: {status}",
         "recommended_action": "manual_review",
     }
 
@@ -1241,7 +1250,8 @@ def normalize_requirement_evidence_for_stage(
     if not isinstance(evidence, list):
         return evidence
     stage = str(state.get("stage", ""))
-    task = current_task(root, state) if stage == "apply" else None
+    task = current_task(root, state) if stage == "apply" and state.get("change_id") else None
+    selected_profile = get_profile(str(state.get("scenario_profile") or DEFAULT_PROFILE.name))
     normalized: list[Any] = []
     for item in evidence:
         if not isinstance(item, dict):
@@ -1254,7 +1264,7 @@ def normalize_requirement_evidence_for_stage(
         current = {key: value for key, value in current.items() if key in allowed}
         if stage == "apply" and task is not None and current.get("status") != "satisfied":
             requirement = str(current.get("requirement", ""))
-            if not evidence_matches_theme(requirement, task_expected_themes(task)):
+            if not evidence_matches_theme(requirement, task_expected_themes(task, selected_profile)):
                 continue
         normalized.append(current)
     return normalized
@@ -1379,8 +1389,8 @@ def realized_files_match_theme(root: Path, paths: list[str], markers: list[str])
     return False
 
 
-def task_expected_themes(task: dict[str, Any] | None) -> list[str]:
-    return profile_task_expected_themes(task, COMPETITION_PROFILE)
+def task_expected_themes(task: dict[str, Any] | None, profile=DEFAULT_PROFILE) -> list[str]:
+    return profile_task_expected_themes(task, profile)
 
 
 def parse_plan_task_contracts(root: Path, state: dict[str, Any]) -> dict[str, dict[str, str]]:
@@ -1414,17 +1424,18 @@ def current_task_contract(root: Path, state: dict[str, Any]) -> dict[str, str] |
     if task is None:
         return None
     contracts = parse_plan_task_contracts(root, state)
-    resolved = resolve_plan_contract_for_task(task, contracts)
+    selected_profile = get_profile(str(state.get("scenario_profile") or DEFAULT_PROFILE.name))
+    resolved = resolve_plan_contract_for_task(task, contracts, selected_profile)
     if resolved is not None:
         return resolved
-    return synthesized_task_contract(task)
+    return synthesized_task_contract(task, selected_profile)
 
 
-def synthesized_task_contract(task: dict[str, Any]) -> dict[str, str] | None:
+def synthesized_task_contract(task: dict[str, Any], profile=DEFAULT_PROFILE) -> dict[str, str] | None:
     targets = task_declared_targets(task)
     implementation_targets = [path for path in targets if not is_test_path(path)]
     test_targets = [path for path in targets if is_test_path(path)]
-    expected = task_expected_themes(task)
+    expected = task_expected_themes(task, profile)
     theme = ", ".join(
         {
             "custom_header_payload": "custom header payload",
@@ -1518,8 +1529,8 @@ def evidence_line_is_specific(value: str) -> bool:
     )
 
 
-def themes_from_text(value: str) -> list[str]:
-    return profile_themes_from_text(value, COMPETITION_PROFILE)
+def themes_from_text(value: str, profile=DEFAULT_PROFILE) -> list[str]:
+    return profile_themes_from_text(value, profile)
 
 
 def contains_word_marker(text: str, marker: str) -> bool:
@@ -1554,6 +1565,7 @@ def validate_plan_contracts(root: Path, state: dict[str, Any]) -> list[str]:
     tasks = task_entries(root, state)
     if not tasks:
         return ["plan.md cannot be validated before tasks.md defines bounded tasks"]
+    selected_profile = get_profile(str(state.get("scenario_profile") or DEFAULT_PROFILE.name))
     contracts = parse_plan_task_contracts(root, state)
     errors: list[str] = []
     task_ids = {task["id"] for task in tasks}
@@ -1580,11 +1592,11 @@ def validate_plan_contracts(root: Path, state: dict[str, Any]) -> list[str]:
             errors.append(f"plan.md task {task['id']} implementation_targets is too generic")
         if test_targets and not target_line_is_specific(test_targets):
             errors.append(f"plan.md task {task['id']} test_targets is too generic")
-        expected = task_expected_themes(task)
+        expected = task_expected_themes(task, selected_profile)
         theme_text = normalize_text(contract.get("theme", ""))
         matched_by_targets = contract_matches_task_targets(task, contract)
         for theme in expected:
-            markers = theme_markers(COMPETITION_PROFILE, theme)
+            markers = theme_markers(selected_profile, theme)
             if not any(marker in theme_text for marker in markers) and not matched_by_targets:
                 errors.append(f"plan.md task {task['id']} theme does not cover expected topic: {theme}")
     extra = sorted(set(contracts) - task_ids)
@@ -1704,13 +1716,17 @@ def contract_matches_task_targets(task: dict[str, Any], contract: dict[str, str]
     )
 
 
-def resolve_plan_contract_for_task(task: dict[str, Any], contracts: dict[str, dict[str, str]]) -> dict[str, str] | None:
+def resolve_plan_contract_for_task(
+    task: dict[str, Any],
+    contracts: dict[str, dict[str, str]],
+    profile=DEFAULT_PROFILE,
+) -> dict[str, str] | None:
     exact = contracts.get(task["id"])
     if exact is not None:
         exact = dict(exact)
         exact["_task_id"] = task["id"]
         return exact
-    expected = task_expected_themes(task)
+    expected = task_expected_themes(task, profile)
     for contract_id, contract in contracts.items():
         candidate = dict(contract)
         candidate["_task_id"] = contract_id
@@ -1718,7 +1734,7 @@ def resolve_plan_contract_for_task(task: dict[str, Any], contracts: dict[str, di
             return candidate
         theme_text = normalize_text(candidate.get("theme", ""))
         if expected and all(
-            any(marker in theme_text for marker in theme_markers(COMPETITION_PROFILE, theme))
+            any(marker in theme_text for marker in theme_markers(profile, theme))
             for theme in expected
         ):
             return candidate
@@ -1764,6 +1780,7 @@ def validate_plan_commitment_coverage(root: Path, state: dict[str, Any], current
     contracts = parse_plan_task_contracts(root, state)
     if not contracts:
         return []
+    selected_profile = get_profile(str(state.get("scenario_profile") or DEFAULT_PROFILE.name))
     satisfied = [
         item
         for item in collect_requirement_evidence(root, state, current)
@@ -1771,19 +1788,19 @@ def validate_plan_commitment_coverage(root: Path, state: dict[str, Any], current
     ]
     errors: list[str] = []
     for task_id, contract in contracts.items():
-        fallback_themes = themes_from_text(contract.get("theme", ""))
+        fallback_themes = themes_from_text(contract.get("theme", ""), selected_profile)
         for field in ("verification", "evidence"):
             value = contract.get(field, "")
             if not value:
                 continue
-            themes = themes_from_text(value)
+            themes = themes_from_text(value, selected_profile)
             if not themes:
                 themes = fallback_themes
             if not themes:
-                errors.append(f"plan.md task {task_id} {field} is not mappable to a competition theme")
+                errors.append(f"plan.md task {task_id} {field} is not mappable to a scenario theme")
                 continue
             for theme in themes:
-                markers = theme_markers(COMPETITION_PROFILE, theme)
+                markers = theme_markers(selected_profile, theme)
                 if not any(evidence_matches_theme(str(item.get("requirement", "")), markers) for item in satisfied):
                     errors.append(f"plan.md task {task_id} {field} has no realized evidence for theme: {theme}")
         implementation_targets = contract.get("implementation_targets", "")
@@ -1792,7 +1809,7 @@ def validate_plan_commitment_coverage(root: Path, state: dict[str, Any], current
         for item in satisfied:
             requirement = str(item.get("requirement", ""))
             if any(
-                evidence_matches_theme(requirement, theme_markers(COMPETITION_PROFILE, theme))
+                evidence_matches_theme(requirement, theme_markers(selected_profile, theme))
                 for theme in fallback_themes
             ):
                 task_evidence.append(item)
@@ -1824,17 +1841,18 @@ def validate_apply_task_requirement_alignment(
 ) -> list[str]:
     if state["stage"] != "apply" or task is None:
         return []
+    selected_profile = get_profile(str(state.get("scenario_profile") or DEFAULT_PROFILE.name))
     expected = (
-        themes_from_text(str(contract.get("theme", "")))
+        themes_from_text(str(contract.get("theme", "")), selected_profile)
         if contract_is_documentation_only(contract)
-        else task_expected_themes(task)
+        else task_expected_themes(task, selected_profile)
     )
     if not expected:
         return []
     satisfied = [item for item in evidence if isinstance(item, dict) and item.get("status") == "satisfied"]
     errors: list[str] = []
     for theme in expected:
-        markers = theme_markers(COMPETITION_PROFILE, theme)
+        markers = theme_markers(selected_profile, theme)
         if any(evidence_matches_theme(str(item.get("requirement", "")), markers) for item in satisfied):
             continue
         realized_paths = [
@@ -1873,7 +1891,7 @@ def collect_requirement_evidence(root: Path, state: dict[str, Any], current: dic
 
 def validate_competition_requirement_coverage(root: Path, state: dict[str, Any], current: dict[str, Any]) -> list[str]:
     evidence = collect_requirement_evidence(root, state, current)
-    profile = get_profile(str(state.get("scenario_profile") or COMPETITION_PROFILE.name))
+    profile = get_profile(str(state.get("scenario_profile") or DEFAULT_PROFILE.name))
     return validate_requirement_coverage(state["stage"], evidence, profile)
 
 
@@ -1947,7 +1965,7 @@ def commit_all(root: Path, message: str) -> str:
 
 def read_task(value: str | None, root: Path) -> str:
     if not value:
-        raise SddError("Competition task must be provided or resolved from the default branch objective")
+        raise SddError("Scenario task must be provided or resolved from the default profile objective")
     candidate = Path(value)
     if not candidate.is_absolute():
         candidate = root / candidate
@@ -1956,12 +1974,16 @@ def read_task(value: str | None, root: Path) -> str:
     else:
         text = value.strip()
     if len(text) < 10:
-        raise SddError("Competition task must contain at least 10 characters")
+        raise SddError("Scenario task must contain at least 10 characters")
     return text
 
 
 def resolve_competition_objective(value: str | None, root: Path) -> dict[str, Any]:
     return resolve_scenario_objective(value, root, COMPETITION_PROFILE.name)
+
+
+def resolve_default_objective(value: str | None, root: Path) -> dict[str, Any]:
+    return resolve_scenario_objective(value, root, DEFAULT_PROFILE.name)
 
 
 def resolve_scenario_objective(value: str | None, root: Path, profile_name: str | None) -> dict[str, Any]:
@@ -1973,7 +1995,7 @@ def resolve_scenario_objective(value: str | None, root: Path, profile_name: str 
 
 def slugify(value: str) -> str:
     words = re.findall(r"[a-z0-9]+", value.lower())
-    base = "-".join(words[:6]) or "competition-change"
+    base = "-".join(words[:6]) or "sdd-change"
     return base[:60].strip("-")
 
 
@@ -2058,7 +2080,7 @@ def start(args: argparse.Namespace) -> None:
         getattr(args, "scenario_profile", None),
     )
     write_runtime_objective_bundle(root, objective_bundle)
-    scenario_profile = str(objective_bundle.get("profile") or COMPETITION_PROFILE.name)
+    scenario_profile = str(objective_bundle.get("profile") or DEFAULT_PROFILE.name)
     selected_profile = get_profile(scenario_profile)
     scenario_constraints = list(objective_bundle["scenario_constraints"])
     required_outcomes = list(objective_bundle["required_outcomes"])
@@ -2325,7 +2347,7 @@ def build_packet(root: Path, state: dict[str, Any]) -> dict[str, Any]:
             ]
         )
         allowed = list(dict.fromkeys(allowed))
-    selected_profile = get_profile(str(state.get("scenario_profile", COMPETITION_PROFILE.name)))
+    selected_profile = get_profile(str(state.get("scenario_profile", DEFAULT_PROFILE.name)))
     scenario_profile = selected_profile.name
     scenario_constraints = list(state.get("scenario_constraints", state.get("competition_constraints", list(DEFAULT_COMPETITION_CONSTRAINTS))))
     required_outcomes = list(
@@ -3513,7 +3535,7 @@ def rehearse_recovery(args: argparse.Namespace) -> None:
     with services.locks():
         snapshot = services.workspace.initialize(VERSION)
     root = services.workspace.work_project_root
-    scenario_profile = getattr(args, "scenario_profile", None) or COMPETITION_PROFILE.name
+    scenario_profile = getattr(args, "scenario_profile", None) or DEFAULT_PROFILE.name
     objective_bundle = resolve_scenario_objective(
         getattr(args, "task", None), source_root, scenario_profile
     )
@@ -3783,7 +3805,7 @@ def parser() -> argparse.ArgumentParser:
         "--profile",
         dest="scenario_profile",
         choices=registered_profiles(),
-        default=COMPETITION_PROFILE.name,
+        default=DEFAULT_PROFILE.name,
         help="Scenario profile controlling defaults, acceptance themes, and skill routing",
     )
     competition.add_argument("--change-id", help="Optional kebab-case change identifier")
@@ -3801,7 +3823,7 @@ def parser() -> argparse.ArgumentParser:
         "--profile",
         dest="scenario_profile",
         choices=registered_profiles(),
-        default=COMPETITION_PROFILE.name,
+        default=DEFAULT_PROFILE.name,
     )
     start_cmd.set_defaults(func=start)
 
@@ -3836,7 +3858,7 @@ def parser() -> argparse.ArgumentParser:
         "--profile",
         dest="scenario_profile",
         choices=registered_profiles(),
-        default=COMPETITION_PROFILE.name,
+        default=DEFAULT_PROFILE.name,
     )
     rehearse_recovery_cmd.add_argument("--change-id", help="Optional kebab-case change identifier")
     rehearse_recovery_cmd.add_argument("--max-steps", type=int, default=50)

@@ -1,4 +1,4 @@
-"""Runtime service composition for an external competition run."""
+"""Runtime service composition for an external hosted SDD run."""
 
 from __future__ import annotations
 

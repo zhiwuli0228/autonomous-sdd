@@ -6,11 +6,10 @@
 
 ## Binding Constraints
 
-- Support custom header payload content through a parameter.
-- Support variable-length custom header payload content.
-- Preserve unpack correctness after customization.
-- Preserve the existing build entrypoint and legacy CLI behavior.
-- Deliver the tool skill for THX/header inspection plus validating tests.
+- Preserve existing public behavior unless the request explicitly changes it.
+- Keep the change inside approved repository boundaries.
+- Prefer small, verifiable edits with concrete evidence.
+- Use host or project skills only when the task packet routes them.
 
 ## Scope
 

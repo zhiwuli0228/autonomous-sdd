@@ -200,13 +200,15 @@ PROFILE_REGISTRY: dict[str, ScenarioProfile] = {
     GENERIC_HOSTED_PROFILE.name: GENERIC_HOSTED_PROFILE,
 }
 
+DEFAULT_PROFILE = GENERIC_HOSTED_PROFILE
+
 
 def normalize_profile_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
 
 
 def get_profile(name: str | None = None) -> ScenarioProfile:
-    selected = name or COMPETITION_PROFILE.name
+    selected = name or DEFAULT_PROFILE.name
     try:
         return PROFILE_REGISTRY[selected]
     except KeyError as exc:
@@ -220,7 +222,7 @@ def registered_profiles() -> tuple[str, ...]:
 
 def stage_skill_requirements(
     stage: str,
-    profile: ScenarioProfile = COMPETITION_PROFILE,
+    profile: ScenarioProfile = DEFAULT_PROFILE,
     skill_routing: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     requirements = profile.stage_skill_map.get(stage, ())
@@ -253,7 +255,7 @@ def theme_markers(profile: ScenarioProfile, theme: str) -> list[str]:
     return list(profile.requirement_themes[theme])
 
 
-def themes_from_text(value: str, profile: ScenarioProfile = COMPETITION_PROFILE) -> list[str]:
+def themes_from_text(value: str, profile: ScenarioProfile = DEFAULT_PROFILE) -> list[str]:
     text = normalize_profile_text(value)
     themes: list[str] = []
     for theme, markers in profile.requirement_themes.items():
@@ -262,7 +264,7 @@ def themes_from_text(value: str, profile: ScenarioProfile = COMPETITION_PROFILE)
     return themes
 
 
-def task_expected_themes(task: dict[str, Any] | None, profile: ScenarioProfile = COMPETITION_PROFILE) -> list[str]:
+def task_expected_themes(task: dict[str, Any] | None, profile: ScenarioProfile = DEFAULT_PROFILE) -> list[str]:
     if not task:
         return []
     title = normalize_profile_text(str(task.get("title", "")))
@@ -284,7 +286,7 @@ def task_expected_themes(task: dict[str, Any] | None, profile: ScenarioProfile =
 def resolve_profile_objective(
     value: str | None,
     root: Path,
-    profile: ScenarioProfile = COMPETITION_PROFILE,
+    profile: ScenarioProfile = DEFAULT_PROFILE,
     *,
     frozen_at: str,
 ) -> dict[str, Any]:
@@ -301,7 +303,7 @@ def resolve_profile_objective(
             source = "inline"
             input_path = None
         if len(text) < 10:
-            raise ValueError("Competition task must contain at least 10 characters")
+            raise ValueError("Scenario objective must contain at least 10 characters")
         branch_default_used = False
     else:
         text = profile.default_objective
@@ -321,7 +323,7 @@ def resolve_profile_objective(
         "scenario_constraints": constraints,
         "required_outcomes": required_outcomes,
         "scenario_tooling_constraints": tooling_constraints,
-        # Compatibility aliases for existing competition-oriented consumers.
+        # Compatibility aliases for existing consumers that still read legacy keys.
         "competition_constraints": constraints,
         "required_acceptance_invariants": required_outcomes,
         "tooling_integration_constraints": tooling_constraints,
@@ -333,7 +335,7 @@ def resolve_profile_objective(
 def validate_requirement_coverage(
     stage: str,
     evidence: list[dict[str, Any]],
-    profile: ScenarioProfile = COMPETITION_PROFILE,
+    profile: ScenarioProfile = DEFAULT_PROFILE,
 ) -> list[str]:
     if stage not in {"verify", "finalize", "archive", "retrospective", "closed"}:
         return []
